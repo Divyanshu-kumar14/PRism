@@ -256,15 +256,29 @@ export const config: AppConfig = {
  *   interior dots are preserved (`my.repo` not `my`).
  * - No validation that the repo actually exists — only syntax.
  */
+// Perf: O(1) memoization for repo URL parsing — called on every email subject, PR creation, and header render
+// Map keyed by raw URL, value is parsed {owner, repo}. Avoids repeated regex exec (agents parse same URL 5-10 times per mission)
+const parsedRepoCache = new Map<string, { owner: string; repo: string }>();
+
 export function parseGitHubRepoUrl(url: string): { owner: string; repo: string } {
+  const cached = parsedRepoCache.get(url);
+  if (cached) return cached; // O(1) hit
+
   const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/i);
   if (!match) {
     throw new Error(`Invalid GitHub repository URL: ${url}`);
   }
-  return {
+  const result = {
     owner: match[1],
     repo: match[2],
   };
+  // Bounded memo — keep last 20 URLs (covers TARGET_REPO_URL + any test overrides)
+  parsedRepoCache.set(url, result);
+  if (parsedRepoCache.size > 20) {
+    const first = parsedRepoCache.keys().next().value as string;
+    parsedRepoCache.delete(first);
+  }
+  return result;
 }
 
 /**

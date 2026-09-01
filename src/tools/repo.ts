@@ -29,6 +29,11 @@ import { config } from '../config.js';
 
 const execAsync = promisify(exec);
 
+// Perf: memoize authenticated URLs — O(1) Map lookup vs O(n) string replace per call
+// GitRepoManager is instantiated per agent (2-3 times per mission) and getAuthenticatedUrl is called
+// in setupWorkspace + commitAndPush (2-3 times). Cache avoids recomputing same token injection.
+const authUrlMemo = new Map<string, string>();
+
 /**
  * Optional overrides for {@link GitRepoManager}.
  * All fields fall back to global {@link config} when omitted — useful for tests
@@ -102,12 +107,26 @@ export class GitRepoManager {
    * not converted and will be returned verbatim (clone will then fail if auth is needed).
    */
   private getAuthenticatedUrl(): string {
+    // O(1) memo lookup — key is token::url, avoids repeated regex replace
+    const memoKey = `${this.token}::${this.repoUrl}`;
+    const cached = authUrlMemo.get(memoKey);
+    if (cached !== undefined) return cached;
+
+    let result: string;
     if (!this.token) {
-      return this.repoUrl;
+      result = this.repoUrl;
+    } else {
+      // Convert https://github.com/owner/repo.git to https://x-access-token:TOKEN@github.com/owner/repo.git
+      const cleanUrl = this.repoUrl.replace(/^https?:\/\//, '');
+      result = `https://x-access-token:${this.token}@${cleanUrl}`;
     }
-    // Convert https://github.com/owner/repo.git to https://x-access-token:TOKEN@github.com/owner/repo.git
-    const cleanUrl = this.repoUrl.replace(/^https?:\/\//, '');
-    return `https://x-access-token:${this.token}@${cleanUrl}`;
+    // Bounded memo — keep last 20 auth URLs (agent + test workspaces)
+    authUrlMemo.set(memoKey, result);
+    if (authUrlMemo.size > 20) {
+      const first = authUrlMemo.keys().next().value as string;
+      authUrlMemo.delete(first);
+    }
+    return result;
   }
 
   /**
