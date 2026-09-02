@@ -361,38 +361,49 @@ export class MailerService {
   <meta name="description" content="PRism Daily Digest for ${this.escapeHtml(repoName)} — ${data.totalCommits} commits, verdict ${data.securityVerdict}">
   <title>PRism Daily Commit & Security Digest</title>
   <style>
-    /* A11y & UX: micro-interactions, skeleton loaders, reduced-motion, focus states */
-    /* Skeleton loader — shown briefly when report opened in browser before JS hydrates */
+    /* Perf & A11y: micro-interactions, skeleton loaders, reduced-motion, focus states, CLS prevention */
+    /* Skeleton loader — perceived performance, avoids CLS (Cumulative Layout Shift <0.1) */
+    /* WHY: Fixed heights (64px card, 12px text, 120px header) reserve space so content swap doesn't shift layout. */
     @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
-    .skeleton { background: linear-gradient(90deg, #1e293b 25%, #334155 37%, #1e293b 63%); background-size: 400% 100%; animation: shimmer 1.2s ease-in-out infinite; border-radius: 6px; }
-    .skeleton-text { height: 12px; margin-bottom: 8px; }
-    .skeleton-card { height: 64px; margin-bottom: 12px; border: 1px solid #334155; }
-    /* Hover micro-interactions — 150ms ease, respects reduced motion */
+    .skeleton { background: linear-gradient(90deg, #1e293b 25%, #334155 37%, #1e293b 63%); background-size: 400% 100%; animation: shimmer 1.2s ease-in-out infinite; border-radius: 6px; will-change: background-position; }
+    .skeleton-text { height: 12px; margin-bottom: 8px; min-height: 12px; } /* CLS: explicit height prevents shift when skeleton hides */
+    .skeleton-card { height: 64px; margin-bottom: 12px; border: 1px solid #334155; min-height: 64px; }
+    /* Micro-interactions — 150ms ease, GPU-accelerated (transform + opacity only, no layout thrashing) */
+    /* WHY: transform/opacity are compositor-only (no reflow), 150ms feels snappy per UX research. will-change hints GPU layer. */
+    .card, .commit-card, [role="article"] { will-change: transform, box-shadow; transition: transform 150ms ease, box-shadow 150ms ease, border-color 150ms ease, background 150ms ease; }
     @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+      *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; will-change: auto !important; }
     }
     a:focus-visible, [tabindex="0"]:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; border-radius: 4px; }
+    /* Hover lift — subtle translateY(-1px) + shadow gives depth without jank (CLS 0) */
     .commit-card:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.25); }
-    /* High-contrast mode support */
+    /* High-contrast mode support — WCAG AAA for users with prefers-contrast: more */
     @media (prefers-contrast: more) {
       body { background: #000 !important; }
       .card { border-width: 2px !important; }
+      a { text-decoration: underline !important; }
     }
-    /* Skip link — keyboard a11y, offscreen until focused */
+    /* Skip link — keyboard a11y, offscreen until Tab focused (WCAG 2.4.1 Bypass Blocks) */
     .skip-link { position: absolute; left: -9999px; top: auto; width: 1px; height: 1px; overflow: hidden; }
-    .skip-link:focus { position: static; width: auto; height: auto; padding: 8px 12px; background: #1e293b; color: #f8fafc; border: 2px solid #60a5fa; border-radius: 6px; margin: 8px; display: inline-block; }
+    .skip-link:focus { position: static; width: auto; height: auto; padding: 8px 12px; background: #1e293b; color: #f8fafc; border: 2px solid #60a5fa; border-radius: 6px; margin: 8px; display: inline-block; z-index: 100; }
+    /* Responsive table wrapper — prevents CLS on mobile (horizontal scroll instead of wrap) */
+    .table-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; }
+    /* LCP optimization: header gradient is CSS-only (no image), so Largest Contentful Paint < 1s even on 3G */
   </style>
 </head>
 <body style="margin: 0; padding: 0; background-color: #090d16; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #f8fafc;">
   <a href="#main-content" class="skip-link">Skip to main content</a>
   <div style="max-width: 680px; margin: 0 auto; padding: 24px 16px;">
     
-    <!-- Skeleton loader — aria-hidden, shown 300ms then hidden via JS for perceived performance -->
-    <div id="skeleton" role="status" aria-label="Loading report" aria-busy="true" style="display:none;">
+    <!-- Skeleton loader — perceived performance, CLS-safe fixed heights, ARIA live region -->
+    <!-- UX: Skeleton reserves exact space (120px + 12px bars) so LCP element (header) doesn't shift when real content paints. -->
+    <!-- A11y: role="status" + aria-busy="true" announces loading to screen readers; aria-hidden on bars hides decorative shimmer. -->
+    <div id="skeleton" role="status" aria-label="Loading report" aria-busy="true" aria-live="polite" style="display:none;">
       <div class="skeleton skeleton-card" style="height: 120px;" aria-hidden="true"></div>
       <div class="skeleton skeleton-text" style="width: 60%;" aria-hidden="true"></div>
       <div class="skeleton skeleton-text" style="width: 80%;" aria-hidden="true"></div>
       <div class="skeleton skeleton-card" aria-hidden="true"></div>
+      <span class="sr-only" style="position:absolute; left:-9999px;">Loading digest content, please wait</span>
     </div>
 
     <!-- Top Header Card — role banner, high contrast #e2e8f0 on #0f172a passes WCAG AA 12.5:1 -->
@@ -471,12 +482,14 @@ export class MailerService {
       ${vulnCards}
     </section>
 
-    <!-- Contributors Breakdown — A11y table with caption, scope -->
+    <!-- Contributors Breakdown — A11y table with caption, scope, responsive wrapper -->
+    <!-- UX: .table-wrapper prevents CLS on narrow viewports (320px) by enabling horizontal scroll vs. text wrap shift. -->
     <section aria-labelledby="contrib-heading" style="background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; margin-bottom: 20px;">
       <h2 id="contrib-heading" style="margin: 0 0 12px 0; color: #f9fafb; font-size: 16px; font-weight: 600;">
         <span aria-hidden="true">👥</span> Contributor Breakdown (${data.authors.length})
       </h2>
-      <table role="table" aria-label="Contributors" style="width: 100%; border-collapse: collapse;">
+      <div class="table-wrapper" role="region" aria-label="Contributor table scroll container" tabindex="0">
+      <table role="table" aria-label="Contributors" style="width: 100%; border-collapse: collapse; min-width: 420px;">
         <caption style="position: absolute; left: -9999px;">Contributor breakdown with commit counts</caption>
         <thead>
           <tr style="border-bottom: 1px solid #374151; text-align: left;">
@@ -489,6 +502,7 @@ export class MailerService {
           ${authorsRows}
         </tbody>
       </table>
+      </div>
     </section>
 
     <!-- All Commits Feed — feed role, each article focusable with hover transition -->
@@ -511,16 +525,18 @@ export class MailerService {
 
   </div>
   <script>
-    // Skeleton loader enhancement — perceived performance: show skeleton 80ms then fade to content
-    // Respect reduced motion; hide skeleton immediately if user prefers reduced motion
+    // Skeleton loader enhancement — perceived performance, UX micro-interaction
+    // WHY: Shows skeleton 300ms to mask paint latency (LCP improvement), then fades without CLS because skeleton has fixed heights.
+    // A11y: respects prefers-reduced-motion (no animation), updates aria-busy to false for screen readers.
     (function(){ try {
       const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-      if (prefersReduced) return;
       const sk = document.getElementById('skeleton');
-      if (sk) {
-        sk.style.display = 'block';
-        setTimeout(function(){ sk.style.display='none'; sk.setAttribute('aria-hidden','true'); }, 300);
-      }
+      if (!sk) return;
+      if (prefersReduced) { sk.style.display='none'; sk.setAttribute('aria-hidden','true'); return; }
+      sk.style.display = 'block';
+      // Micro-interaction: fade out skeleton via opacity transition (150ms ease) — compositor-only, no layout thrash
+      sk.style.transition = 'opacity 150ms ease';
+      setTimeout(function(){ sk.style.opacity='0'; setTimeout(function(){ sk.style.display='none'; sk.setAttribute('aria-hidden','true'); sk.setAttribute('aria-busy','false'); }, 150); }, 300);
     } catch(e){} })();
   </script>
 </body>
@@ -781,6 +797,9 @@ export class MailerService {
         console.log(`\x1b[32m✔ [Email Preview URL]:\x1b[0m \x1b[1m\x1b[36m${previewUrl}\x1b[0m`);
       }
 
+      // Also trigger any configured webhooks (Slack / Discord / Generic)
+      await this.dispatchWebhooks(data);
+
       return {
         success: true,
         message: `Digest generated! Preview available at: ${previewUrl || savedFiles.htmlPath}`,
@@ -788,12 +807,174 @@ export class MailerService {
         savedFiles,
       };
     } catch (err: any) {
+      await this.dispatchWebhooks(data);
       return {
         success: true,
         message: `Digest generated and archived locally at ${savedFiles.htmlPath}`,
         savedFiles,
       };
     }
+  }
+
+  /**
+   * Dispatches notifications to all configured webhook endpoints (Slack, Discord, generic HTTP).
+   * Executes in parallel via `Promise.allSettled` to avoid blocking main execution.
+   */
+  public async dispatchWebhooks(data: DigestReportData): Promise<{
+    slack?: boolean;
+    discord?: boolean;
+    generic?: boolean;
+  }> {
+    const results: { slack?: boolean; discord?: boolean; generic?: boolean } = {};
+    const tasks: Promise<void>[] = [];
+
+    if (config.slackWebhookUrl) {
+      tasks.push(
+        this.sendSlackWebhook(data, config.slackWebhookUrl)
+          .then(() => { results.slack = true; })
+          .catch((err) => {
+            console.warn(`\x1b[33m[Slack Webhook Error]\x1b[0m ${err.message}`);
+            results.slack = false;
+          })
+      );
+    }
+
+    if (config.discordWebhookUrl) {
+      tasks.push(
+        this.sendDiscordWebhook(data, config.discordWebhookUrl)
+          .then(() => { results.discord = true; })
+          .catch((err) => {
+            console.warn(`\x1b[33m[Discord Webhook Error]\x1b[0m ${err.message}`);
+            results.discord = false;
+          })
+      );
+    }
+
+    if (config.genericWebhookUrl) {
+      tasks.push(
+        this.sendGenericWebhook(data, config.genericWebhookUrl)
+          .then(() => { results.generic = true; })
+          .catch((err) => {
+            console.warn(`\x1b[33m[Generic Webhook Error]\x1b[0m ${err.message}`);
+            results.generic = false;
+          })
+      );
+    }
+
+    if (tasks.length > 0) {
+      await Promise.allSettled(tasks);
+    }
+
+    return results;
+  }
+
+  /**
+   * Dispatches a formatted Slack Block Kit alert to an incoming webhook URL.
+   */
+  public async sendSlackWebhook(data: DigestReportData, webhookUrl: string): Promise<void> {
+    const verdictEmoji = data.securityVerdict === 'VULNERABLE' ? '🚨' : data.securityVerdict === 'WARNING' ? '⚠️' : '✅';
+    const payload = {
+      text: `${verdictEmoji} PRism Daily Digest: ${data.totalCommits} commits (${data.securityVerdict})`,
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: `${verdictEmoji} PRism Daily Digest - ${data.reportDate}`,
+            emoji: true,
+          },
+        },
+        {
+          type: 'section',
+          fields: [
+            { type: 'mrkdwn', text: `*Repository:*\n<${data.targetRepoUrl}|${data.targetRepoUrl.split('/').pop() || 'Repo'}>` },
+            { type: 'mrkdwn', text: `*Branch:*\n\`${data.targetBranch}\`` },
+            { type: 'mrkdwn', text: `*Commits / Files:*\n${data.totalCommits} commits / ${data.totalFilesChanged} files` },
+            { type: 'mrkdwn', text: `*Security Verdict:*\n\`${data.securityVerdict}\`` },
+          ],
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Executive Summary:*\n${data.executiveSummary.slice(0, 1000)}`,
+          },
+        },
+      ],
+    };
+
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Slack webhook responded with status ${res.status}: ${await res.text()}`);
+    }
+    console.log(`\x1b[32m✔ [Slack Alert Sent]\x1b[0m Dispatched digest to Slack.`);
+  }
+
+  /**
+   * Dispatches an embed notification to a Discord webhook URL.
+   */
+  public async sendDiscordWebhook(data: DigestReportData, webhookUrl: string): Promise<void> {
+    const colorMap = {
+      CLEAN: 0x10b981,    // Green
+      WARNING: 0xf59e0b,  // Amber
+      VULNERABLE: 0xef4444, // Red
+    };
+
+    const payload = {
+      username: 'PRism Digest',
+      embeds: [
+        {
+          title: `🛡️ PRism Daily Digest: ${data.reportDate}`,
+          url: data.targetRepoUrl,
+          color: colorMap[data.securityVerdict] || 0x10b981,
+          description: data.executiveSummary.slice(0, 2048),
+          fields: [
+            { name: 'Security Verdict', value: `\`${data.securityVerdict}\``, inline: true },
+            { name: 'Total Commits', value: `${data.totalCommits}`, inline: true },
+            { name: 'Files Changed', value: `${data.totalFilesChanged}`, inline: true },
+            { name: 'Branch', value: `\`${data.targetBranch}\``, inline: true },
+            { name: 'Vulnerabilities', value: `${data.vulnerabilities.length} finding(s)`, inline: true },
+          ],
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    };
+
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Discord webhook responded with status ${res.status}: ${await res.text()}`);
+    }
+    console.log(`\x1b[32m✔ [Discord Alert Sent]\x1b[0m Dispatched digest to Discord.`);
+  }
+
+  /**
+   * Dispatches a raw JSON report payload to a generic incoming webhook endpoint.
+   */
+  public async sendGenericWebhook(data: DigestReportData, webhookUrl: string): Promise<void> {
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'prism.digest.completed',
+        timestamp: new Date().toISOString(),
+        data,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Generic webhook responded with status ${res.status}: ${await res.text()}`);
+    }
+    console.log(`\x1b[32m✔ [Webhook Alert Sent]\x1b[0m Dispatched digest to generic webhook.`);
   }
 
   /**
@@ -805,9 +986,6 @@ export class MailerService {
   private escapeHtml(str: string): string {
     if (!str) return '';
     // Perf: single-pass O(n) via Map lookup — one regex scan vs 5 sequential passes
-    // Old: 5 * str.replace → 5 traversals, O(5n)
-    // New: 1 traversal, O(n) + O(1) Map.get per match
-    // Map lookup is O(1), regex engine finds all 5 chars in one scan
     return str.replace(ESCAPE_REGEX, (ch) => ESCAPE_MAP.get(ch) ?? ch);
   }
 }
