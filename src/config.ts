@@ -7,6 +7,14 @@
  *   consumes — no ad-hoc `process.env` reads elsewhere.
  * - Provides `parseGitHubRepoUrl()` and `createGenAIClient()` helpers that
  *   encapsulate URL parsing and the Vertex AI ↔ AI Studio auth switch.
+ * - Implements memoization caches for O(1) repeated lookups (repo URL parsing).
+ *
+ * **Performance Optimizations:**
+ * - **O(1) memoization for repo URL parsing**: Map keyed by raw URL → parsed {owner, repo}.
+ *   Avoids repeated regex exec (agents parse same URL 5-10 times per mission).
+ * - **Config validation at boot**: Zod schema validation runs once at import time.
+ *   Fail-fast design — invalid config throws immediately with field-by-field diagnostics.
+ * - **Singleton pattern**: `config` exported as const — no re-validation on subsequent imports.
  *
  * @example
  * ```ts
@@ -33,6 +41,8 @@ dotenv.config();
  * Zod validation schema for strongly-typed application configuration.
  *
  * Validates types, formats (emails, URLs, ports), and numeric bounds at boot time.
+ * WHY: Fail-fast at startup rather than cryptic runtime errors downstream.
+ * Each field has sensible defaults for local development.
  */
 export const AppConfigSchema = z.object({
   useEnterprise: z.boolean().default(false),
@@ -78,6 +88,9 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
  * @param env - Source environment variables dictionary (defaults to `process.env`).
  * @returns Fully validated and strongly typed {@link AppConfig}.
  * @throws {Error} If configuration fails Zod schema validation with clear field-by-field diagnostics.
+ *
+ * **Performance**: Runs once at module import. Subsequent imports reuse the singleton `config`.
+ * **Env-var aliases**: Multiple names supported for each field (see table in `config` export).
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const gcpProject = env.GOOGLE_CLOUD_PROJECT || env.GCP_PROJECT || env.GCLOUD_PROJECT;
@@ -142,6 +155,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
  * import { config } from './config.js';
  * if (!config.githubToken) console.warn('PR creation will fail — set GITHUB_TOKEN');
  * ```
+ *
+ * **Performance**: Validated once at import. O(1) property access thereafter.
+ * **Hot-reload**: In development, `.env` changes require process restart (dotenv caches).
  */
 export const config: AppConfig = loadConfig();
 
@@ -172,9 +188,10 @@ export const config: AppConfig = loadConfig();
  * - Repo names with dots (e.g. `my.repo`) — only the final `.git` is stripped;
  *   interior dots are preserved (`my.repo` not `my`).
  * - No validation that the repo actually exists — only syntax.
+ *
+ * **Performance**: O(1) memoization cache (bounded to 20 entries).
+ * Called on every email subject, PR creation, and header render — avoids repeated regex exec.
  */
-// Perf: O(1) memoization for repo URL parsing — called on every email subject, PR creation, and header render
-// Map keyed by raw URL, value is parsed {owner, repo}. Avoids repeated regex exec (agents parse same URL 5-10 times per mission)
 const parsedRepoCache = new Map<string, { owner: string; repo: string }>();
 
 export function parseGitHubRepoUrl(url: string): { owner: string; repo: string } {
@@ -227,6 +244,8 @@ export function parseGitHubRepoUrl(url: string): { owner: string; repo: string }
  * - Missing credentials are not thrown here — the first `generateContent` call will
  *   fail with an auth error (fail-loudly by design).
  * - `location` is only meaningful in enterprise mode (ignored otherwise).
+ *
+ * **Performance**: Called once per agent instance. Client creation is O(1) — no config re-validation.
  */
 export function createGenAIClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
