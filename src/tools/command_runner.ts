@@ -6,6 +6,18 @@
  *   `npm test`, `npx vitest run`, `git status`, `npx tsc --noEmit`, etc.
  * - Executes every command **inside** `workspaceRoot` (`cwd`), with a shared
  *   `CI=true` env, 60 s default timeout, and 10 MB stdout/stderr buffers.
+ * - Implements LRU cache for idempotent read-only git commands (O(1) lookup).
+ * - Provides structured logging for observability and debugging.
+ *
+ * **Performance Optimizations:**
+ * - **O(1) cache for read-only git commands**: Avoids spawning child_process for
+ *   repeated `git status`, `git diff`, `git log` queries within same agent turn.
+ *   TTL 3s — ensures freshness after write_file but captures duplicates like
+ *   `git status` twice in 1s. Only caches safe read-only prefixes.
+ * - **Bounded output truncation**: 8000 chars per stream keeps LLM context small
+ *   while preserving error context. `maxBuffer: 10MB` prevents OOM from runaway commands.
+ * - **Sanitized environment**: Host secrets (PAT, API keys) stripped before execution —
+ *   prevents credential leakage to workspace child processes.
  *
  * **Key configurations / parameters**
  * | Param       | Type     | Default | Notes |
@@ -38,7 +50,46 @@
 import { exec } from 'child_process';
 import type { FunctionDeclaration } from '@google/genai';
 
-// Perf: LRU cache for idempotent read-only git commands
+// ── Types for structured logging ──────────────────────────────────────────
+
+/** Command categorization for structured logging and metrics. */
+export type CommandCategory =
+  | 'git-read'        // git status, diff, log, show (cached)
+  | 'git-write'       // git add, commit, push (never cached)
+  | 'test'            // npm test, npx vitest, npx jest
+  | 'build'           // npm run build, npx tsc
+  | 'install'         // npm install, npm ci
+  | 'lint'            // npx eslint, npx prettier
+  | 'other';          // uncategorized
+
+/** Categorizes a command for logging/metrics. O(1) string prefix checks. */
+function categorizeCommand(cmd: string): CommandCategory {
+  const trimmed = cmd.trim();
+  if (trimmed.startsWith('git status') || trimmed.startsWith('git diff') ||
+      trimmed.startsWith('git log') || trimmed.startsWith('git diff-tree') ||
+      trimmed.startsWith('git show')) return 'git-read';
+  if (trimmed.startsWith('git add') || trimmed.startsWith('git commit') ||
+      trimmed.startsWith('git push') || trimmed.startsWith('git checkout') ||
+      trimmed.startsWith('git branch')) return 'git-write';
+  if (trimmed.includes('test') || trimmed.includes('vitest') || trimmed.includes('jest')) return 'test';
+  if (trimmed.includes('build') || trimmed.includes('tsc') || trimmed.includes('compile')) return 'build';
+  if (trimmed.startsWith('npm install') || trimmed.startsWith('npm ci') || trimmed.startsWith('yarn install') || trimmed.startsWith('pnpm install')) return 'install';
+  if (trimmed.includes('eslint') || trimmed.includes('prettier') || trimmed.includes('lint')) return 'lint';
+  return 'other';
+}
+
+/** Sanitizes command for logging (removes potential secrets in args). */
+function sanitizeForLogging(cmd: string): string {
+  // Mask common secret patterns in command args
+  return cmd
+    .replace(/--token[=\s]+[^\s]+/gi, '--token=***')
+    .replace(/--password[=\s]+[^\s]+/gi, '--password=***')
+    .replace(/--api-key[=\s]+[^\s]+/gi, '--api-key=***')
+    .replace(/Authorization:\s*[^\s]+/gi, 'Authorization: ***')
+    .replace(/Bearer\s+[^\s]+/gi, 'Bearer ***');
+}
+
+// ── Performance: LRU cache for idempotent read-only git commands ──────────
 // O(1) Map lookup avoids spawning child_process for repeated queries within same agent turn
 // TTL 3s — ensures freshness after write_file but captures duplicates like `git status` twice in 1s
 // Only caches safe read-only prefixes: 'git status', 'git diff', 'git log', 'git diff-tree'
@@ -61,6 +112,8 @@ function isCacheableCommand(cmd: string): boolean {
 function buildCacheKey(workspaceRoot: string, command: string): string {
   return `${workspaceRoot}::${command}`;
 }
+
+// ── Param interfaces ──────────────────────────────────────────────────────
 
 /**
  * Parameters for `run_command`.
@@ -102,6 +155,8 @@ export const runCommandFunctionDeclaration: FunctionDeclaration = {
 // ── Security Guardrails & Sanitization ───────────────────────────────────
 
 // Host credential keys that must NEVER be leaked to workspace child processes
+// WHY: Child processes inherit parent env; if we don't strip these, agents could
+// accidentally leak credentials via `env` command or subprocess logging.
 const SENSITIVE_ENV_KEYS = new Set([
   'GITHUB_TOKEN',
   'GH_TOKEN',
@@ -118,6 +173,7 @@ const SENSITIVE_ENV_KEYS = new Set([
 
 /**
  * Returns a sanitized copy of process.env stripped of PRism host credentials.
+ * Also injects `CI=true` to disable interactive prompts in test runners.
  */
 export function getSanitizedEnv(): NodeJS.ProcessEnv {
   const sanitized: NodeJS.ProcessEnv = { ...process.env, CI: 'true' };
@@ -129,14 +185,15 @@ export function getSanitizedEnv(): NodeJS.ProcessEnv {
 
 /**
  * Detects destructive system operations or attempts to leak host environment secrets.
+ * Uses regex patterns for O(1) detection — no AST parsing needed.
  */
 export function isDangerousCommand(command: string): { blocked: boolean; reason?: string } {
   const trimmed = command.trim();
 
-  // 1. Destructive system operations
+  // 1. Destructive system operations (privilege escalation, disk formatting, fork bombs)
   if (
     /(^|\s)(sudo|su\s|mkfs[a-z0-9.]*|fdisk|dd\s+if=|shutdown|reboot|poweroff)(\s|$)/i.test(trimmed) ||
-    /:\(\)\s*\{\s*:\|:&\s*\};\s*:/i.test(trimmed) || // Fork bomb
+    /:\(\)\s*\{\s*:\|:&\s*\};\s*:/i.test(trimmed) || // Fork bomb :(){ :|:& };:
     /rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(\/|~|\/\*)/i.test(trimmed) // rm -rf / or ~
   ) {
     return {
@@ -145,7 +202,7 @@ export function isDangerousCommand(command: string): { blocked: boolean; reason?
     };
   }
 
-  // 2. Direct attempts to read host .env
+  // 2. Direct attempts to read host .env files (path traversal to parent)
   if (/(?:cat|grep|head|tail|less|more|nano|vim|vi|source|\.)\s+.*(?:\.\.\/.*\.env|\.env\.local)/i.test(trimmed)) {
     return {
       blocked: true,
@@ -155,6 +212,8 @@ export function isDangerousCommand(command: string): { blocked: boolean; reason?
 
   return { blocked: false };
 }
+
+// ── Main Executor ─────────────────────────────────────────────────────────
 
 /**
  * Executes a shell command inside `workspaceRoot` and captures the result.
@@ -169,6 +228,7 @@ export function isDangerousCommand(command: string): { blocked: boolean; reason?
  * - `CI=true` is merged into `process.env` for the child to disable interactive modes.
  * - Host secret environment variables (PAT, API keys) are stripped before execution.
  * - Both streams are truncated independently at 8000 chars before resolving.
+ * - Structured logging emitted for observability (category, duration, exit code).
  *
  * @example
  * ```ts
@@ -181,9 +241,11 @@ export async function executeRunCommand(
   workspaceRoot: string,
   params: RunCommandParams
 ): Promise<{ stdout: string; stderr: string; exitCode: number; success: boolean; durationMs: number }> {
-  // Security guardrail check
+  // Security guardrail check — O(1) regex checks
   const safetyCheck = isDangerousCommand(params.command);
   if (safetyCheck.blocked) {
+    // Log security violation for audit trail
+    console.warn(`\x1b[31m[SECURITY]\x1b[0m Blocked command: ${sanitizeForLogging(params.command)} — ${safetyCheck.reason}`);
     return {
       stdout: '',
       stderr: `[Security Violation] Command blocked by PRism security policy: ${safetyCheck.reason}`,
@@ -193,6 +255,11 @@ export async function executeRunCommand(
     };
   }
 
+  // Structured log: command start
+  const category = categorizeCommand(params.command);
+  const sanitizedCmd = sanitizeForLogging(params.command);
+  console.log(`\x1b[36m[CMD:${category}]\x1b[0m ${sanitizedCmd}`);
+
   // Perf: O(1) cache check for idempotent git reads — avoids process spawn (20-40ms saved per hit)
   // Only read-only git commands are cached; every other command bypasses cache to preserve correctness
   if (isCacheableCommand(params.command)) {
@@ -200,6 +267,7 @@ export async function executeRunCommand(
     const cached = commandCache.get(key);
     if (cached && Date.now() - cached.ts < CMD_CACHE_TTL_MS) {
       // Cache hit — return cloned result with 0 durationMs overhead
+      console.log(`\x1b[90m[CACHE HIT]\x1b[0m ${sanitizedCmd} (cached)`);
       return { ...cached.result, durationMs: 0 };
     }
   }
@@ -220,8 +288,9 @@ export async function executeRunCommand(
       (error, stdout, stderr) => {
         const durationMs = Date.now() - startTime;
         const exitCode = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
-        
+
         // Truncate output if excessively long to keep prompt context clean
+        // Perf: independent truncation per stream — O(1) slice operations
         const maxLen = 8000;
         const cleanStdout = stdout && stdout.length > maxLen ? stdout.slice(0, maxLen) + '\n...[Output truncated]' : stdout || '';
         const cleanStderr = stderr && stderr.length > maxLen ? stderr.slice(0, maxLen) + '\n...[Error truncated]' : stderr || '';
@@ -233,6 +302,11 @@ export async function executeRunCommand(
           success: exitCode === 0,
           durationMs,
         };
+
+        // Structured log: command completion
+        const statusIcon = result.success ? '\x1b[32m✔\x1b[0m' : '\x1b[31m✖\x1b[0m';
+        const timeoutFlag = error && error.killed ? ' \x1b[33m(TIMEOUT)\x1b[0m' : '';
+        console.log(`\x1b[36m[CMD:${category}]\x1b[0m ${statusIcon} exit=${exitCode} duration=${durationMs}ms${timeoutFlag}`);
 
         // Store in LRU cache if cacheable — O(1) Map set
         if (isCacheableCommand(params.command)) {
