@@ -78,19 +78,38 @@ const auditCache = new Map<string, { ts: number; result: { npmAudit?: any; secre
 const AUDIT_TTL_MS = 60_000;
 
 // O(1) Map for secret pattern lookup — allows single-pass regex test then O(1) type resolution
-// vs nested loop O(L * P) where P=5 constant, but Map avoids repeated array scans per line
-// Stored as Map<type, RegExp> for O(1) iteration via Map.entries() and future extensibility
+// WHY: Previously O(L*P) nested loops (L = added lines ~5000, P = 9 patterns => 45k regex tests).
+// Now O(L) single exec per line via combined named-group regex, then O(1) groups lookup.
 const SECRET_PATTERN_MAP = new Map<string, RegExp>([
   ['Private Key', /-----BEGIN (?:RSA|EC|PGP|OPENSSH|DSA)? ?PRIVATE KEY-----/i],
   ['AWS Access Key', /AKIA[0-9A-Z]{16}/],
+  ['AWS Secret/Session Token', /(?:aws_secret_access_key|aws_session_token)\s*[:=]\s*['"][a-zA-Z0-9/+=]{20,}['"]/i],
   ['GitHub Personal Access Token', /ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82}/],
-  ['Generic API Key / Secret String', /(?:api_key|apikey|secret_key|api_secret|access_token|bearer)\s*[:=]\s*['"][a-zA-Z0-9_\-]{20,}['"]/i],
-  ['Database Connection String with Credentials', /postgres(?:ql)?:\/\/[a-zA-Z0-9_-]+:[^@]+@/i],
+  ['Slack Token', /xox[baprs]-[0-9]{10,13}-[a-zA-Z0-9-]+/],
+  ['Stripe Secret Key', /(?:sk_live|rk_live)_[a-zA-Z0-9]{24,}/],
+  ['JSON Web Token', /eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+/],
+  ['Generic API Key / Secret String', /(?:api_key|apikey|secret_key|api_secret|access_token|bearer|private_token)\s*[:=]\s*['"][a-zA-Z0-9_\-]{20,}['"]/i],
+  ['Database Connection String with Credentials', /(?:postgres(?:ql)?|mongodb(?:\+srv)?|mysql):\/\/[a-zA-Z0-9_-]+:[^@]+@/i],
 ]);
-// Single combined regex for O(L) scan vs O(L*P) nested loops — tests all patterns in one pass
-// Built from Map values joined with '|', executed once per added line; type resolved via Map O(1) lookup below
+
+// Helper: sanitize Map key ("Private Key" → "PrivateKey") for named capture group identifier
+function sanitizeGroupName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9]/g, '');
+}
+
+// Named-group mapping: groupName → human type, O(1) Map lookup for exec result
+const GROUP_TO_TYPE_MAP = new Map<string, string>(
+  Array.from(SECRET_PATTERN_MAP.keys()).map((k) => [sanitizeGroupName(k), k])
+);
+
+// Single combined regex with named capture groups for O(L) scan vs O(L*P) nested loops
+// WHY: One exec per line returns groups => immediate type without inner loop over patterns.
+// Before: COMBINED.test(line) + loop regex.test per pattern = 1 + P execs per matching line.
+// After: 1 exec per line total (10× fewer for worst-case 5k matches). Type resolved via O(1) Map.
 const COMBINED_SECRET_REGEX = new RegExp(
-  Array.from(SECRET_PATTERN_MAP.values()).map((r) => `(?:${r.source})`).join('|'),
+  Array.from(SECRET_PATTERN_MAP.entries())
+    .map(([type, re]) => `(?<${sanitizeGroupName(type)}>${re.source})`)
+    .join('|'),
   'i'
 );
 
@@ -142,6 +161,11 @@ export interface RunSecurityAuditParams {
    * @defaultValue `true`
    */
   includeNpmAudit?: boolean;
+  /**
+   * Optional git revision range to scan for leaked secrets (e.g. "HEAD~10 HEAD" or "origin/main..HEAD").
+   * Defaults to "HEAD~5 HEAD" with graceful fallback.
+   */
+  commitRange?: string;
 }
 
 /**
@@ -244,7 +268,7 @@ export const getCommitDiffFunctionDeclaration: FunctionDeclaration = {
 
 /**
  * Gemini tool declaration for `run_security_audit`.
- * Runs regex secret scans on `HEAD~5..HEAD` added lines plus optional `npm audit`.
+ * Runs regex secret scans on git diffs plus optional `npm audit`.
  */
 export const runSecurityAuditFunctionDeclaration: FunctionDeclaration = {
   name: 'run_security_audit',
@@ -255,6 +279,10 @@ export const runSecurityAuditFunctionDeclaration: FunctionDeclaration = {
       includeNpmAudit: {
         type: 'boolean',
         description: 'Whether to run npm audit in the workspace if package.json is present. Defaults to true.',
+      },
+      commitRange: {
+        type: 'string',
+        description: 'Optional git revision range or commit to scan (e.g. "HEAD~10 HEAD", "HEAD~1 HEAD"). Defaults to "HEAD~5 HEAD".',
       },
     },
   },
@@ -580,31 +608,45 @@ export async function executeRunSecurityAudit(
   // New: single COMBINED_SECRET_REGEX.test per line → O(L), then O(1) Map resolution for matchType
   // For 5000 added lines: 25k regex tests → 5k tests (5x fewer), plus Map O(1) type resolution
   try {
-    const gitDiffRes = await execAsync('git diff HEAD~5 HEAD', { cwd: workspaceRoot }).catch(() => ({ stdout: '' }));
+    const range = params.commitRange || 'HEAD~5 HEAD';
+    let gitDiffRes = await execAsync(`git diff ${range}`, { cwd: workspaceRoot }).catch(() => ({ stdout: '' }));
+    
+    // Graceful fallback if specified range or HEAD~5 is invalid (e.g. fresh repo with <5 commits)
+    if (!gitDiffRes.stdout && !params.commitRange) {
+      gitDiffRes = await execAsync('git diff HEAD~1 HEAD', { cwd: workspaceRoot }).catch(() => ({ stdout: '' }));
+      if (!gitDiffRes.stdout) {
+        gitDiffRes = await execAsync('git diff HEAD', { cwd: workspaceRoot }).catch(() => ({ stdout: '' }));
+      }
+    }
+
     if (gitDiffRes.stdout) {
       const lines = gitDiffRes.stdout.split('\n');
       let currentFile = 'unknown';
+      // Perf: O(L) single pass — each added line exec'd once vs O(L*P) nested. Named groups give O(1) type.
+      // WHY: Combined regex with (?<Group>pattern) captures type in one exec; inner loop eliminated.
+      // Saves 45k → 5k regex ops for 5k lines × 9 patterns. Groups lookup is O(1) Map.
       for (const line of lines) {
         if (line.startsWith('+++ b/')) {
           currentFile = line.replace('+++ b/', '').trim();
           continue;
         }
         if (line.startsWith('+') && !line.startsWith('+++')) {
-          // Single-pass combined check — O(1) per line vs O(P)
-          if (!COMBINED_SECRET_REGEX.test(line)) continue;
-          // O(1) Map lookup to resolve which pattern matched — iterate Map entries (P=5 constant)
-          // This second pass only runs for lines that already matched combined regex (rare: <1% of lines)
-          // So amortized cost is O(L) + O(matches * P) ≈ O(L)
-          for (const [type, regex] of SECRET_PATTERN_MAP.entries()) {
-            if (regex.test(line)) {
-              secretScanResults.push({
-                file: currentFile,
-                matchType: type, // O(1) Map key lookup
-                snippet: line.trim().slice(0, 100),
-              });
-              break; // one finding per line is sufficient — avoids duplicate reports for same line
+          // Single exec O(1) vs test + loop — also avoids regex lastIndex double-test bug
+          const match = COMBINED_SECRET_REGEX.exec(line);
+          if (!match || !match.groups) continue;
+          // O(1) groups lookup — find first non-undefined named group (constant P=9, early exit)
+          let matchedType = 'Generic API Key / Secret String';
+          for (const [groupName, type] of GROUP_TO_TYPE_MAP.entries()) {
+            if (match.groups[groupName] !== undefined) {
+              matchedType = type;
+              break; // O(1) early exit — one hit per line
             }
           }
+          secretScanResults.push({
+            file: currentFile,
+            matchType: matchedType, // O(1) Map-resolved type
+            snippet: line.trim().slice(0, 100),
+          });
         }
       }
     }
