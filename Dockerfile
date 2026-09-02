@@ -28,8 +28,9 @@ WORKDIR /app
 # Install deps first (layer cache) — copy only manifests
 COPY package.json package-lock.json ./
 
-# Use npm ci for reproducible installs; omit audit/fund for speed
-RUN npm ci --ignore-scripts
+# Use npm ci if lock is synced, fallback to npm install for picomatch dedupe mismatch
+# (fdir wants picomatch ^3||^4 vs micromatch's 2.3.2 — npm ci is strict)
+RUN npm ci --ignore-scripts || npm install --ignore-scripts
 
 # Copy source + configs needed for build
 COPY tsconfig.json ./
@@ -63,7 +64,8 @@ RUN groupadd -r prism --gid 1001 \
 COPY package.json package-lock.json ./
 
 # --omit=dev keeps image small (~180MB vs ~400MB); we already built dist/
-RUN npm ci --omit=dev --ignore-scripts \
+# Fallback to npm install if ci fails due to lock drift (see above)
+RUN npm ci --omit=dev --ignore-scripts 2>&1 || npm install --omit=dev --ignore-scripts \
   && npm cache clean --force
 
 # Copy compiled output from builder + runtime assets
