@@ -99,6 +99,63 @@ export const runCommandFunctionDeclaration: FunctionDeclaration = {
   },
 };
 
+// ── Security Guardrails & Sanitization ───────────────────────────────────
+
+// Host credential keys that must NEVER be leaked to workspace child processes
+const SENSITIVE_ENV_KEYS = new Set([
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'SMTP_PASS',
+  'SMTP_USER',
+  'SMTP_HOST',
+  'RESEND_API_KEY',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'DATABASE_URL',
+]);
+
+/**
+ * Returns a sanitized copy of process.env stripped of PRism host credentials.
+ */
+export function getSanitizedEnv(): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = { ...process.env, CI: 'true' };
+  for (const key of SENSITIVE_ENV_KEYS) {
+    delete sanitized[key];
+  }
+  return sanitized;
+}
+
+/**
+ * Detects destructive system operations or attempts to leak host environment secrets.
+ */
+export function isDangerousCommand(command: string): { blocked: boolean; reason?: string } {
+  const trimmed = command.trim();
+
+  // 1. Destructive system operations
+  if (
+    /(^|\s)(sudo|su\s|mkfs[a-z0-9.]*|fdisk|dd\s+if=|shutdown|reboot|poweroff)(\s|$)/i.test(trimmed) ||
+    /:\(\)\s*\{\s*:\|:&\s*\};\s*:/i.test(trimmed) || // Fork bomb
+    /rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(\/|~|\/\*)/i.test(trimmed) // rm -rf / or ~
+  ) {
+    return {
+      blocked: true,
+      reason: 'Blocked dangerous system command or privilege escalation.',
+    };
+  }
+
+  // 2. Direct attempts to read host .env
+  if (/(?:cat|grep|head|tail|less|more|nano|vim|vi|source|\.)\s+.*(?:\.\.\/.*\.env|\.env\.local)/i.test(trimmed)) {
+    return {
+      blocked: true,
+      reason: 'Blocked attempt to read parent or host environment files.',
+    };
+  }
+
+  return { blocked: false };
+}
+
 /**
  * Executes a shell command inside `workspaceRoot` and captures the result.
  *
@@ -110,6 +167,7 @@ export const runCommandFunctionDeclaration: FunctionDeclaration = {
  * **Implementation notes**
  * - `maxBuffer: 10 MiB` — if exceeded, Node kills the child and `stderr` may be empty.
  * - `CI=true` is merged into `process.env` for the child to disable interactive modes.
+ * - Host secret environment variables (PAT, API keys) are stripped before execution.
  * - Both streams are truncated independently at 8000 chars before resolving.
  *
  * @example
@@ -123,6 +181,18 @@ export async function executeRunCommand(
   workspaceRoot: string,
   params: RunCommandParams
 ): Promise<{ stdout: string; stderr: string; exitCode: number; success: boolean; durationMs: number }> {
+  // Security guardrail check
+  const safetyCheck = isDangerousCommand(params.command);
+  if (safetyCheck.blocked) {
+    return {
+      stdout: '',
+      stderr: `[Security Violation] Command blocked by PRism security policy: ${safetyCheck.reason}`,
+      exitCode: 1,
+      success: false,
+      durationMs: 0,
+    };
+  }
+
   // Perf: O(1) cache check for idempotent git reads — avoids process spawn (20-40ms saved per hit)
   // Only read-only git commands are cached; every other command bypasses cache to preserve correctness
   if (isCacheableCommand(params.command)) {
@@ -136,6 +206,7 @@ export async function executeRunCommand(
 
   const startTime = Date.now();
   const timeout = params.timeoutMs || 60000;
+  const childEnv = getSanitizedEnv();
 
   return new Promise((resolve) => {
     exec(
@@ -144,10 +215,7 @@ export async function executeRunCommand(
         cwd: workspaceRoot,
         timeout,
         maxBuffer: 10 * 1024 * 1024, // 10MB — prevents OOM from runaway `npm audit` / `git log`
-        env: {
-          ...process.env,
-          CI: 'true',
-        },
+        env: childEnv,
       },
       (error, stdout, stderr) => {
         const durationMs = Date.now() - startTime;
