@@ -818,7 +818,39 @@ export class MailerService {
 
   /**
    * Dispatches notifications to all configured webhook endpoints (Slack, Discord, generic HTTP).
-   * Executes in parallel via `Promise.allSettled` to avoid blocking main execution.
+   *
+   * **What it does**
+   * - Checks `config.slackWebhookUrl` / `discordWebhookUrl` / `genericWebhookUrl`.
+   * - Fires all that are set **in parallel** via `Promise.allSettled` — one failing (404/timeout)
+   *   never cancels the others and never throws to the caller.
+   * - Called automatically at the end of {@link sendDigestEmail} (both Ethereal and archive-only paths),
+   *   so webhooks are best-effort and never make the digest `success:false`.
+   *
+   * **Key configurations / parameters**
+   * | Env | Example | Payload shape |
+   * |-----|---------|---------------|
+   * | `SLACK_WEBHOOK_URL` | `https://hooks.slack.com/services/T…` | Slack Block Kit (`header` + 4 `mrkdwn` fields + summary) |
+   * | `DISCORD_WEBHOOK_URL` | `https://discord.com/api/webhooks/…` | Embed (`title`/`color`/`fields`/`timestamp`) |
+   * | `WEBHOOK_URL` / `GENERIC_WEBHOOK_URL` | `https://example.com/hook` | `{ event:"prism.digest.completed", timestamp, data: DigestReportData }` |
+   *
+   * **Usage examples**
+   * ```ts
+   * const svc = new MailerService();
+   * // auto-called inside sendDigestEmail:
+   * await svc.dispatchWebhooks(reportData);
+   * // manual:
+   * const r = await svc.dispatchWebhooks(reportData);
+   * console.log(r); // { slack:true, discord:false, generic:true }
+   * ```
+   *
+   * **Edge cases / gotchas**
+   * - Returns `{}` when no webhook env is set (no network call).
+   * - Each sub-call catches its own error and logs `[Slack Webhook Error]` — check console, not return throw.
+   * - `Promise.allSettled` ensures Discord still fires even if Slack 404s — do not use `Promise.all`.
+   * - Generic webhook sends the **full** `DigestReportData` JSON — ensure receiver handles large payloads.
+   *
+   * @param data - Fully populated {@link DigestReportData}.
+   * @returns Per-channel success map (missing key = not configured).
    */
   public async dispatchWebhooks(data: DigestReportData): Promise<{
     slack?: boolean;
@@ -870,6 +902,32 @@ export class MailerService {
 
   /**
    * Dispatches a formatted Slack Block Kit alert to an incoming webhook URL.
+   *
+   * **What it does**
+   * - Builds a Block Kit payload: `header` (emoji + date) + `section` fields (Repo/Branch/Commits·Files/Verdict) + summary (1000-char slice).
+   * - Uses Slack `mrkdwn` (`<url|text>`) so links are accessible in Slack clients.
+   * - `POST`s JSON to `webhookUrl`; throws on non-`2xx` so {@link dispatchWebhooks} can mark `slack:false`.
+   *
+   * **Key configurations / parameters**
+   * | Param | Type | Notes |
+   * |-------|------|-------|
+   * | `data` | `DigestReportData` | `securityVerdict` maps to emoji `🚨`/`⚠️`/`✅` |
+   * | `webhookUrl` | `string` | Incoming webhook from Slack App → Incoming Webhooks → copy URL |
+   *
+   * **Usage example**
+   * ```ts
+   * await svc.sendSlackWebhook(reportData, process.env.SLACK_WEBHOOK_URL!);
+   * // console: ✔ [Slack Alert Sent] Dispatched digest to Slack.
+   * ```
+   *
+   * **Edge cases / gotchas**
+   * - Slack truncates `text` at ~3000 chars — summary is pre-sliced to 1000 to stay safe.
+   * - Invalid URL → `fetch` throws → caller logs `[Slack Webhook Error]` but digest still succeeds.
+   * - Test with `curl -X POST -H 'Content-Type: application/json' -d '{"text":"hello"}' $SLACK_WEBHOOK_URL`.
+   *
+   * @param data - Report payload (uses `reportDate`, `targetRepoUrl`, `securityVerdict`, `executiveSummary`, counts).
+   * @param webhookUrl - Full Slack incoming webhook URL.
+   * @throws {Error} If Slack responds non-`2xx` (status + body in message).
    */
   public async sendSlackWebhook(data: DigestReportData, webhookUrl: string): Promise<void> {
     const verdictEmoji = data.securityVerdict === 'VULNERABLE' ? '🚨' : data.securityVerdict === 'WARNING' ? '⚠️' : '✅';
@@ -917,6 +975,33 @@ export class MailerService {
 
   /**
    * Dispatches an embed notification to a Discord webhook URL.
+   *
+   * **What it does**
+   * - Builds a Discord embed: `title` (`🛡️ PRism Daily Digest: <date>`), `color` (green/amber/red by verdict),
+   *   `description` (executive summary 2048-char), 5 inline `fields` (Verdict/Commits/Files/Branch/Vuln count), `timestamp`.
+   * - `username` is `PRism Digest` so it appears as a bot.
+   * - `POST`s to `webhookUrl`; throws on non-`2xx`.
+   *
+   * **Key configurations / parameters**
+   * | Param | Type | Notes |
+   * |-------|------|-------|
+   * | `data` | `DigestReportData` | `color` maps `CLEAN→0x10b981`, `WARNING→0xf59e0b`, `VULNERABLE→0xef4444` |
+   * | `webhookUrl` | `string` | Discord Channel → Integrations → Webhooks → Copy URL |
+   *
+   * **Usage example**
+   * ```ts
+   * await svc.sendDiscordWebhook(reportData, process.env.DISCORD_WEBHOOK_URL!);
+   * // console: ✔ [Discord Alert Sent]
+   * ```
+   *
+   * **Edge cases / gotchas**
+   * - Discord `description` capped at 4096 chars (we slice at 2048 + other fields stay under 6000 total).
+   * - Embed `color` is an integer `0xRRGGBB`, not a CSS string.
+   * - Rate-limited (429) → currently surfaces as thrown error; caller logs but doesn't retry — add retry if needed.
+   *
+   * @param data - Report payload.
+   * @param webhookUrl - Full Discord webhook URL.
+   * @throws {Error} If Discord responds non-`2xx`.
    */
   public async sendDiscordWebhook(data: DigestReportData, webhookUrl: string): Promise<void> {
     const colorMap = {
@@ -959,6 +1044,32 @@ export class MailerService {
 
   /**
    * Dispatches a raw JSON report payload to a generic incoming webhook endpoint.
+   *
+   * **What it does**
+   * - Sends `{ event:"prism.digest.completed", timestamp: ISO, data: DigestReportData }` as JSON.
+   * - Generic receiver (Zapier, n8n, custom backend) gets the **full** structured report — not a summary.
+   * - `POST`s to `webhookUrl`; throws on non-`2xx`.
+   *
+   * **Key configurations / parameters**
+   * | Param | Type | Notes |
+   * |-------|------|-------|
+   * | `data` | `DigestReportData` | Full report including `commits`, `vulnerabilities`, `authors`, `categorizedChanges` |
+   * | `webhookUrl` | `string` | Any `https://` endpoint; set via `WEBHOOK_URL` or `GENERIC_WEBHOOK_URL` |
+   *
+   * **Usage example**
+   * ```ts
+   * await svc.sendGenericWebhook(reportData, 'https://example.com/hooks/prism');
+   * // receiver sees: { event:"prism.digest.completed", data:{ reportDate, securityVerdict, commits:[...] } }
+   * ```
+   *
+   * **Edge cases / gotchas**
+   * - Payload can be large (commits + diffs summaries) — ensure receiver raises body limit if needed (often 1MB default is enough).
+   * - No auth header is sent — add via URL query (`?token=…`) or put a proxy in front if auth is needed.
+   * - `fetch` timeout is not set — slow webhook will block ~ Node default; wrap with `AbortSignal.timeout(5000)` if strict latency required.
+   *
+   * @param data - Report payload.
+   * @param webhookUrl - Full generic webhook URL.
+   * @throws {Error} If endpoint responds non-`2xx`.
    */
   public async sendGenericWebhook(data: DigestReportData, webhookUrl: string): Promise<void> {
     const res = await fetch(webhookUrl, {
