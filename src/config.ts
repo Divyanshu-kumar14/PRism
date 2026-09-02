@@ -23,159 +23,107 @@
 
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import { z } from 'zod';
 
 // Load `.env` on import so every downstream module sees populated `process.env`.
 // Safe to call multiple times — subsequent calls are no-ops.
 dotenv.config();
 
 /**
- * Strongly-typed application configuration.
+ * Zod validation schema for strongly-typed application configuration.
  *
- * All fields are populated from environment variables with sensible defaults.
- * Never read `process.env` directly outside this file — add a field here instead.
+ * Validates types, formats (emails, URLs, ports), and numeric bounds at boot time.
+ */
+export const AppConfigSchema = z.object({
+  useEnterprise: z.boolean().default(false),
+  project: z.string().optional(),
+  location: z.string().default('us-central1'),
+  model: z.string().min(1).default('gemini-2.5-flash'),
+  githubToken: z.string().default(''),
+  targetRepoUrl: z.string().min(1).default('https://github.com/Divyanshu-kumar14/fluent.git'),
+  targetBranch: z.string().min(1).default('main'),
+  workspaceDir: z.string().min(1).default('./workspace/fluent'),
+  maxTurns: z.number().int().min(1).max(100).default(25),
+
+  // Email & Alerts
+  emailRecipient: z.string().email().default('divyanshukumar.dev@proton.me'),
+  emailFrom: z.string().min(1).default('PRism Digest <noreply@prism.dev>'),
+  smtpHost: z.string().optional(),
+  smtpPort: z.number().int().min(1).max(65535).default(587),
+  smtpUser: z.string().optional(),
+  smtpPass: z.string().optional(),
+  smtpSecure: z.boolean().default(false),
+  resendApiKey: z.string().optional(),
+
+  // Webhooks
+  slackWebhookUrl: z.string().url().optional(),
+  discordWebhookUrl: z.string().url().optional(),
+  genericWebhookUrl: z.string().url().optional(),
+
+  // Scheduling
+  cronSchedule: z.string().min(1).default('0 22 * * *'),
+  cronTimezone: z.string().min(1).default('Asia/Kolkata'),
+});
+
+/**
+ * Strongly-typed application configuration type inferred from {@link AppConfigSchema}.
  *
  * @category Configuration
  */
-export interface AppConfig {
-  /**
-   * `true` when Vertex AI (enterprise) auth should be used.
-   * Requires `GOOGLE_GENAI_USE_VERTEXAI=true` (or the legacy
-   * `GOOGLE_GENAI_USE_ENTERPRISE=true`) **and** a GCP project id.
-   * When `false` the SDK falls back to API-key auth.
-   * @defaultValue `false`
-   * @env `GOOGLE_GENAI_USE_VERTEXAI` | `GOOGLE_GENAI_USE_ENTERPRISE`
-   */
-  useEnterprise: boolean;
+export type AppConfig = z.infer<typeof AppConfigSchema>;
 
-  /**
-   * GCP project id for Vertex AI.
-   * Aliases: `GOOGLE_CLOUD_PROJECT` → `GCP_PROJECT` → `GCLOUD_PROJECT` (first wins).
-   * @env `GOOGLE_CLOUD_PROJECT`
-   * @example "prism-demo-project-10492"
-   */
-  project?: string;
+/**
+ * Parses, resolves environment variable aliases, and validates application configuration via Zod.
+ *
+ * @param env - Source environment variables dictionary (defaults to `process.env`).
+ * @returns Fully validated and strongly typed {@link AppConfig}.
+ * @throws {Error} If configuration fails Zod schema validation with clear field-by-field diagnostics.
+ */
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const gcpProject = env.GOOGLE_CLOUD_PROJECT || env.GCP_PROJECT || env.GCLOUD_PROJECT;
+  const isEnterprise = (env.GOOGLE_GENAI_USE_ENTERPRISE === 'true' || env.GOOGLE_GENAI_USE_VERTEXAI === 'true') && !!gcpProject;
 
-  /**
-   * GCP region for Vertex AI.
-   * @defaultValue "us-central1"
-   * @env `GOOGLE_CLOUD_LOCATION`
-   */
-  location: string;
+  const rawConfig = {
+    useEnterprise: isEnterprise,
+    project: gcpProject || undefined,
+    location: env.GOOGLE_CLOUD_LOCATION || 'us-central1',
+    model: env.GEMINI_MODEL || 'gemini-2.5-flash',
+    githubToken: env.GITHUB_TOKEN || env.GH_TOKEN || '',
+    targetRepoUrl: env.TARGET_REPO_URL || 'https://github.com/Divyanshu-kumar14/fluent.git',
+    targetBranch: env.TARGET_REPO_BRANCH || 'main',
+    workspaceDir: env.WORKSPACE_DIR || './workspace/fluent',
+    maxTurns: parseInt(env.MAX_AGENT_TURNS || '25', 10),
 
-  /**
-   * Gemini model id sent to `generateContent`.
-   * @defaultValue "gemini-2.5-flash"
-   * @env `GEMINI_MODEL`
-   * @example "gemini-2.5-flash" | "gemini-2.0-flash" | "gemini-1.5-pro"
-   */
-  model: string;
+    // Email
+    emailRecipient: env.ALERT_EMAIL_TO || env.EMAIL_TO || 'divyanshukumar.dev@proton.me',
+    emailFrom: env.EMAIL_FROM || 'PRism Digest <noreply@prism.dev>',
+    smtpHost: env.SMTP_HOST || undefined,
+    smtpPort: parseInt(env.SMTP_PORT || '587', 10),
+    smtpUser: env.SMTP_USER || undefined,
+    smtpPass: env.SMTP_PASS || undefined,
+    smtpSecure: env.SMTP_SECURE === 'true',
+    resendApiKey: env.RESEND_API_KEY || undefined,
 
-  /**
-   * GitHub PAT (classic or fine-grained, `repo` scope).
-   * Aliases: `GITHUB_TOKEN` → `GH_TOKEN`.
-   * Empty string means unauthenticated clone / no PR creation.
-   * @env `GITHUB_TOKEN`
-   */
-  githubToken: string;
+    // Webhooks
+    slackWebhookUrl: env.SLACK_WEBHOOK_URL || undefined,
+    discordWebhookUrl: env.DISCORD_WEBHOOK_URL || undefined,
+    genericWebhookUrl: env.WEBHOOK_URL || env.GENERIC_WEBHOOK_URL || undefined,
 
-  /**
-   * HTTPS clone URL of the repository under analysis.
-   * @defaultValue "https://github.com/Divyanshu-kumar14/fluent.git"
-   * @env `TARGET_REPO_URL`
-   */
-  targetRepoUrl: string;
+    // Schedule
+    cronSchedule: env.DIGEST_CRON_SCHEDULE || '0 22 * * *',
+    cronTimezone: env.DIGEST_TIMEZONE || 'Asia/Kolkata',
+  };
 
-  /**
-   * Default branch to clone, diff, and target for PRs.
-   * @defaultValue "main"
-   * @env `TARGET_REPO_BRANCH`
-   */
-  targetBranch: string;
+  const parsed = AppConfigSchema.safeParse(rawConfig);
+  if (!parsed.success) {
+    const errorDetails = parsed.error.issues
+      .map((issue) => `  - [${issue.path.join('.')}]: ${issue.message}`)
+      .join('\n');
+    console.error(`\x1b[31m[Configuration Error] Invalid environment configuration:\x1b[0m\n${errorDetails}`);
+    throw new Error(`Invalid application configuration:\n${errorDetails}`);
+  }
 
-  /**
-   * Local directory where the target repo is cloned.
-   * Resolved to an absolute path by {@link GitRepoManager}.
-   * @defaultValue "./workspace/fluent"
-   * @env `WORKSPACE_DIR`
-   */
-  workspaceDir: string;
-
-  /**
-   * Maximum LLM ↔ tool round-trips per mission.
-   * Prevents infinite loops; covers both {@link CoverageAgent} and {@link DailyCommitDigestAgent}.
-   * @defaultValue 25
-   * @env `MAX_AGENT_TURNS`
-   */
-  maxTurns: number;
-
-  // ── Email & Alert ────────────────────────────────────────────────
-
-  /**
-   * Destination address for daily digest emails.
-   * Aliases: `ALERT_EMAIL_TO` → `EMAIL_TO`.
-   * @defaultValue "divyanshukumar.dev@proton.me"
-   * @env `ALERT_EMAIL_TO`
-   */
-  emailRecipient: string;
-
-  /**
-   * `From:` header for outgoing mail.
-   * @defaultValue "PRism Digest <noreply@prism.dev>"
-   * @env `EMAIL_FROM`
-   */
-  emailFrom: string;
-
-  /** SMTP hostname (e.g. `smtp.gmail.com`). Omit to skip SMTP. @env `SMTP_HOST` */
-  smtpHost?: string;
-
-  /**
-   * SMTP port.
-   * @defaultValue 587
-   * @env `SMTP_PORT`
-   */
-  smtpPort: number;
-
-  /** SMTP username (full email). @env `SMTP_USER` */
-  smtpUser?: string;
-
-  /** SMTP password / app-password. @env `SMTP_PASS` */
-  smtpPass?: string;
-
-  /**
-   * Whether to use implicit TLS. For port 587 use `false` (STARTTLS);
-   * for 465 use `true`.
-   * @defaultValue `false` unless `SMTP_SECURE=true`
-   * @env `SMTP_SECURE`
-   */
-  smtpSecure: boolean;
-
-  /**
-   * Resend.com API key — preferred over SMTP when set.
-   * Falls back to SMTP → Ethereal preview → local archive.
-   * @env `RESEND_API_KEY`
-   */
-  resendApiKey?: string;
-
-  // ── Scheduling ───────────────────────────────────────────────────
-
-  /**
-   * Cron expression for the daily digest daemon.
-   * Uses `node-cron` syntax (5 or 6 fields).
-   * @defaultValue "0 22 * * *` (daily 22:00)
-   * @env `DIGEST_CRON_SCHEDULE`
-   * @example "0 22 * * *" — every day at 22:00
-   * @example "0 9 * * 1"  — every Monday at 09:00
-   */
-  cronSchedule: string;
-
-  /**
-   * IANA timezone for {@link cronSchedule} evaluation.
-   * Must be a valid `Intl` timezone.
-   * @defaultValue "Asia/Kolkata" (IST)
-   * @env `DIGEST_TIMEZONE`
-   * @see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
-   */
-  cronTimezone: string;
+  return parsed.data;
 }
 
 /**
@@ -189,44 +137,13 @@ export interface AppConfig {
  * | `emailRecipient` | `ALERT_EMAIL_TO` → `EMAIL_TO`                     |
  * | `apiKey` (factory) | `GEMINI_API_KEY` → `GOOGLE_API_KEY`           |
  *
- * **Gotchas**
- * - `MAX_AGENT_TURNS` is parsed with `parseInt(..., 10)` — non-numeric values
- *   silently become `NaN` (agent loops guard against it, but validate in CI).
- * - `SMTP_SECURE` is strictly `=== 'true'`; any other truthy string is `false`.
- * - `WORKSPACE_DIR` is stored as-is; conversion to an absolute path happens in
- *   {@link GitRepoManager} via `path.resolve()`.
- *
  * @example
  * ```ts
  * import { config } from './config.js';
  * if (!config.githubToken) console.warn('PR creation will fail — set GITHUB_TOKEN');
  * ```
  */
-export const config: AppConfig = {
-  useEnterprise: (process.env.GOOGLE_GENAI_USE_ENTERPRISE === 'true' || process.env.GOOGLE_GENAI_USE_VERTEXAI === 'true') && !!(process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT),
-  project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT,
-  location: process.env.GOOGLE_CLOUD_LOCATION || 'us-central1',
-  model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-  githubToken: process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '',
-  targetRepoUrl: process.env.TARGET_REPO_URL || 'https://github.com/Divyanshu-kumar14/fluent.git',
-  targetBranch: process.env.TARGET_REPO_BRANCH || 'main',
-  workspaceDir: process.env.WORKSPACE_DIR || './workspace/fluent',
-  maxTurns: parseInt(process.env.MAX_AGENT_TURNS || '25', 10),
-
-  // Email settings (defaults to divyanshukumar.dev@proton.me as requested)
-  emailRecipient: process.env.ALERT_EMAIL_TO || process.env.EMAIL_TO || 'divyanshukumar.dev@proton.me',
-  emailFrom: process.env.EMAIL_FROM || 'PRism Digest <noreply@prism.dev>',
-  smtpHost: process.env.SMTP_HOST,
-  smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
-  smtpUser: process.env.SMTP_USER,
-  smtpPass: process.env.SMTP_PASS,
-  smtpSecure: process.env.SMTP_SECURE === 'true',
-  resendApiKey: process.env.RESEND_API_KEY,
-
-  // Schedule settings (defaults to 10:00 PM IST every day)
-  cronSchedule: process.env.DIGEST_CRON_SCHEDULE || '0 22 * * *',
-  cronTimezone: process.env.DIGEST_TIMEZONE || 'Asia/Kolkata',
-};
+export const config: AppConfig = loadConfig();
 
 /**
  * Extracts `{ owner, repo }` from a GitHub URL.
