@@ -90,11 +90,16 @@ export interface RunMissionOptions {
  * console.log(report);
  * ```
  */
+// Free-tier throttling: 5 RPM → 13s gap (see digest_agent.ts)
+const FREE_TIER_MIN_INTERVAL_MS_COV = 13_000;
+const sleepCov = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export class CoverageAgent {
   private client: GoogleGenAI;
   private model: string;
   private repoManager: GitRepoManager;
   private history: AgentMessage[] = [];
+  private lastGeminiCallMs = 0;
 
   /**
    * @param customModel - Gemeni model id overriding `config.model` for this agent only.
@@ -227,15 +232,43 @@ Guidelines:
       turns++;
       console.log(`\n\x1b[90m[Turn ${turns}/${maxTurns}] Agent thinking...\x1b[0m`);
 
-      // 2. Call Gemini model with history and tools
-      const response = await this.client.models.generateContent({
-        model: this.model,
-        contents: this.history,
-        config: {
-          systemInstruction,
-          tools,
-        },
-      });
+      // Free-tier throttle: keep <5 RPM to avoid 429 on free tier (see digest_agent)
+      const sinceLast = Date.now() - this.lastGeminiCallMs;
+      if (this.lastGeminiCallMs !== 0 && sinceLast < FREE_TIER_MIN_INTERVAL_MS_COV) {
+        const waitMs = FREE_TIER_MIN_INTERVAL_MS_COV - sinceLast;
+        console.log(`\x1b[90m⏳ Free-tier throttle: waiting ${Math.ceil(waitMs / 1000)}s...\x1b[0m`);
+        await sleepCov(waitMs);
+      }
+
+      let response: any;
+      let attempt = 0;
+      while (true) {
+        try {
+          this.lastGeminiCallMs = Date.now();
+          response = await this.client.models.generateContent({
+            model: this.model,
+            contents: this.history,
+            config: {
+              systemInstruction,
+              tools,
+            },
+          });
+          break;
+        } catch (err: any) {
+          const msg = err?.message || '';
+          const is429 = err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
+          const retryMatch = msg.match(/retryDelay.*?(\d+)s/i) || msg.match(/Please retry in (\d+)/i);
+          const retrySec = retryMatch ? parseInt(retryMatch[1], 10) : 50;
+          if (is429 && attempt < 2) {
+            attempt++;
+            const waitMs = (retrySec + 2) * 1000;
+            console.warn(`\x1b[33m⚠️  Gemini 429 — waiting ${retrySec}s (attempt ${attempt}/2)...\x1b[0m`);
+            await sleepCov(waitMs);
+            continue;
+          }
+          throw err;
+        }
+      }
 
       const candidate = response.candidates?.[0];
       if (!candidate || !candidate.content) {

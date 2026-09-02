@@ -99,12 +99,19 @@ export interface RunDigestOptions {
  * console.log(await agent.runDigest({ since: '24 hours ago' }));
  * ```
  */
+// Free-tier throttling: 5 RPM → 60/5 = 12s min interval; use 13s to stay safe
+// WHY: PRism Sentinel makes 7-10 rapid Gemini calls/digest → free tier 429 after 5.
+// Throttling to 13s keeps <5 RPM (≈130s for 10 turns) — no billing needed, just slower.
+const FREE_TIER_MIN_INTERVAL_MS = 13_000;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export class DailyCommitDigestAgent {
   private client: GoogleGenAI;
   private model: string;
   private repoManager: GitRepoManager;
   private history: DigestAgentMessage[] = [];
   private cachedCommits: CommitSummaryItem[] = [];
+  private lastGeminiCallMs = 0;
 
   /**
    * @param customModel - Gemini model id overriding `config.model` for this instance.
@@ -215,14 +222,46 @@ Guidelines:
       turns++;
       console.log(`\n\x1b[90m[Sentinel Turn ${turns}/${maxTurns}] Analyzing repository changes...\x1b[0m`);
 
-      const response = await this.client.models.generateContent({
-        model: this.model,
-        contents: this.history,
-        config: {
-          systemInstruction,
-          tools,
-        },
-      });
+      // Free-tier throttle: ensure <5 RPM (13s gap) — sleep if last call was recent
+      // WHY: Free tier quota is 5 req/min per model; without throttle, 7-10 turns hit 429 RESOURCE_EXHAUSTED.
+      const sinceLast = Date.now() - this.lastGeminiCallMs;
+      if (this.lastGeminiCallMs !== 0 && sinceLast < FREE_TIER_MIN_INTERVAL_MS) {
+        const waitMs = FREE_TIER_MIN_INTERVAL_MS - sinceLast;
+        console.log(`\x1b[90m⏳ Free-tier throttle: waiting ${Math.ceil(waitMs / 1000)}s to stay <5 RPM...\x1b[0m`);
+        await sleep(waitMs);
+      }
+
+      // Retry wrapper for 429 RESOURCE_EXHAUSTED — free tier may still spike
+      // WHY: Even with throttle, concurrent scheduler + manual digest can exceed 5 RPM; retry after RetryInfo delay.
+      let response: any;
+      let attempt = 0;
+      while (true) {
+        try {
+          this.lastGeminiCallMs = Date.now();
+          response = await this.client.models.generateContent({
+            model: this.model,
+            contents: this.history,
+            config: {
+              systemInstruction,
+              tools,
+            },
+          });
+          break; // success
+        } catch (err: any) {
+          const msg = err?.message || '';
+          const is429 = err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
+          const retryMatch = msg.match(/retryDelay.*?(\d+)s/i) || msg.match(/Please retry in (\d+)/i);
+          const retrySec = retryMatch ? parseInt(retryMatch[1], 10) : 50;
+          if (is429 && attempt < 2) {
+            attempt++;
+            const waitMs = (retrySec + 2) * 1000;
+            console.warn(`\x1b[33m⚠️  Gemini 429 quota hit (attempt ${attempt}/2) — waiting ${retrySec}s then retrying...\x1b[0m`);
+            await sleep(waitMs);
+            continue;
+          }
+          throw err;
+        }
+      }
 
       const candidate = response.candidates?.[0];
       if (!candidate || !candidate.content) {
