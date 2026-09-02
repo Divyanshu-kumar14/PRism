@@ -56,6 +56,22 @@ const listCache = new Map<string, { ts: number; result: { entries: string[]; cou
 // Lookup is O(1) vs O(n) array.includes, critical when walking 10k+ entries
 const SHARED_IGNORE_SET = new Set(['.git', 'node_modules', '.next', 'dist', '.turbo', 'build', '.cache']);
 
+// Perf: grep result cache — memoize recent searches O(1) Map hit
+// WHY: Agent often repeats same grep (e.g., "export function" twice) within one mission. Cache saves O(N) file walks.
+// TTL 10s ensures fresh results after write_file; bounded to 40 entries to prevent leak in scheduler daemon.
+// Key includes workspace + query + flags + extension + pathPrefix → exact hit required (Do No Harm: no stale cross-workspace)
+const GREP_CACHE_TTL_MS = 10_000;
+const GREP_CACHE_MAX = 40;
+const grepCache = new Map<string, { ts: number; result: { matches: GrepMatch[]; totalMatches: number; count: number; truncated: boolean } }>();
+
+function buildGrepCacheKey(
+  workspaceRoot: string,
+  params: GrepSearchParams
+): string {
+  // O(1) string concat key — all params participate to avoid false hits
+  return `${path.resolve(workspaceRoot)}::q:${params.query}::r:${params.isRegex ? 1 : 0}::i:${params.caseInsensitive ? 1 : 0}::e:${params.extension ?? ''}::p:${params.pathPrefix ?? '.'}::m:${params.maxResults ?? 50}`;
+}
+
 function evictLRU<K, V>(map: Map<K, V>, max: number): void {
   // O(1) amortized LRU eviction — delete oldest entry (Map preserves insertion order)
   if (map.size > max) {
@@ -98,6 +114,18 @@ export interface WriteFileParams {
   content: string;
 }
 
+/** Parameters for `patch_file`. Performs surgical find-and-replace without full file overwrite. */
+export interface PatchFileParams {
+  /** Relative path of the file to modify within the repository (e.g. `src/lib/utils.ts`). */
+  filePath: string;
+  /** The exact string or code block in the file to replace. Must match existing content exactly. */
+  targetContent: string;
+  /** New replacement string or code block. */
+  replacementContent: string;
+  /** Whether to replace all occurrences if found multiple times. Defaults to false. */
+  allowMultiple?: boolean;
+}
+
 /** Parameters for `list_dir`. */
 export interface ListDirParams {
   /** Relative directory to list (`"."` = workspace root). Defaults to `"."`. */
@@ -108,6 +136,29 @@ export interface ListDirParams {
   maxDepth?: number;
   /** Filter by extension without dot, e.g. `"ts"` → `*.ts`. Dot prefix auto-stripped. */
   extension?: string;
+}
+
+/** Parameters for `grep_search`. Searches text or regex across workspace files. */
+export interface GrepSearchParams {
+  /** Search query string or regex pattern. */
+  query: string;
+  /** Whether to interpret query as a regular expression. Defaults to false. */
+  isRegex?: boolean;
+  /** Whether search is case-insensitive. Defaults to false. */
+  caseInsensitive?: boolean;
+  /** Optional file extension filter without dot (e.g. "ts", "tsx", "json"). */
+  extension?: string;
+  /** Relative directory to scope the search within (e.g. "src", "tests"). Defaults to ".". */
+  pathPrefix?: string;
+  /** Maximum number of line matches to return. Defaults to 50. */
+  maxResults?: number;
+}
+
+/** Single match returned by `grep_search`. */
+export interface GrepMatch {
+  filePath: string;
+  lineNumber: number;
+  lineContent: string;
 }
 
 // ── Gemini function declarations ───────────────────────────────────
@@ -165,6 +216,37 @@ export const writeFileFunctionDeclaration: FunctionDeclaration = {
 };
 
 /**
+ * Gemini tool declaration for `patch_file`.
+ * Surgical find-and-replace for modifying existing files without full rewrites.
+ */
+export const patchFileFunctionDeclaration: FunctionDeclaration = {
+  name: 'patch_file',
+  description: 'Performs a surgical find-and-replace of an exact code snippet or block inside an existing file without overwriting the entire file. The targetContent must match the file content exactly.',
+  parametersJsonSchema: {
+    type: 'object',
+    properties: {
+      filePath: {
+        type: 'string',
+        description: 'Relative path of the file to modify within the repository (e.g., "src/lib/utils.ts", "tests/utils.test.ts").',
+      },
+      targetContent: {
+        type: 'string',
+        description: 'The exact string/lines of code in the file to replace. Must match existing file content exactly including whitespace.',
+      },
+      replacementContent: {
+        type: 'string',
+        description: 'The replacement string/lines of code to insert.',
+      },
+      allowMultiple: {
+        type: 'boolean',
+        description: 'Whether to replace multiple occurrences if found. If false and target occurs >1 times, the patch is rejected. Defaults to false.',
+      },
+    },
+    required: ['filePath', 'targetContent', 'replacementContent'],
+  },
+};
+
+/**
  * Gemini tool declaration for `list_dir`.
  * Hard-codes an ignore list (`.git`, `node_modules`, `.next`, …) to keep the
  * 150-entry cap useful for source exploration.
@@ -192,6 +274,45 @@ export const listDirFunctionDeclaration: FunctionDeclaration = {
         description: 'Optional file extension filter without dot (e.g., "ts", "tsx", "json").',
       },
     },
+  },
+};
+
+/**
+ * Gemini tool declaration for `grep_search`.
+ * Fast regex/text code search across workspace files with line number snippets.
+ */
+export const grepSearchFunctionDeclaration: FunctionDeclaration = {
+  name: 'grep_search',
+  description: 'Searches for exact text or regex patterns across files in the target repository workspace. Returns matching file paths, line numbers, and snippets. Use this to find functions, types, imports, and variables.',
+  parametersJsonSchema: {
+    type: 'object',
+    properties: {
+      query: {
+        type: 'string',
+        description: 'Text string or regular expression pattern to search for across files.',
+      },
+      isRegex: {
+        type: 'boolean',
+        description: 'Whether to treat query as a regular expression. Defaults to false.',
+      },
+      caseInsensitive: {
+        type: 'boolean',
+        description: 'Whether search is case-insensitive. Defaults to false.',
+      },
+      extension: {
+        type: 'string',
+        description: 'Optional file extension filter without dot (e.g., "ts", "tsx", "js").',
+      },
+      pathPrefix: {
+        type: 'string',
+        description: 'Subdirectory path to scope the search within (e.g., "src", "src/lib"). Defaults to ".".',
+      },
+      maxResults: {
+        type: 'integer',
+        description: 'Maximum number of line matches to return. Defaults to 50.',
+      },
+    },
+    required: ['query'],
   },
 };
 
@@ -335,6 +456,11 @@ export function executeWriteFile(workspaceRoot: string, params: WriteFileParams)
         listCache.delete(key);
       }
     }
+    // Perf: invalidate grep cache for this workspace — O(k) where k ≤ 40
+    // WHY: write_file changes file content; cached grep results would be stale. Clear workspace-scoped keys.
+    for (const key of grepCache.keys()) {
+      if (key.startsWith(path.resolve(workspaceRoot))) grepCache.delete(key);
+    }
     return {
       success: true,
       filePath: params.filePath,
@@ -433,5 +559,200 @@ export function executeListDir(workspaceRoot: string, params: ListDirParams): { 
     return result;
   } catch (err: any) {
     return { error: `Failed to list directory: ${err.message}` };
+  }
+}
+
+/**
+ * Surgically replaces an exact code snippet or block within an existing file.
+ *
+ * @param workspaceRoot - Absolute workspace root.
+ * @param params - File path, target content, replacement content, and allowMultiple flag.
+ * @returns `{ success: true, filePath, replacementsCount }` or `{ error }`.
+ *
+ * @example
+ * ```ts
+ * const res = executePatchFile(ws, {
+ *   filePath: 'src/lib/utils.ts',
+ *   targetContent: 'export const x = 1;',
+ *   replacementContent: 'export const x = 2;',
+ * });
+ * ```
+ */
+export function executePatchFile(
+  workspaceRoot: string,
+  params: PatchFileParams
+): { success: boolean; filePath: string; replacementsCount: number } | { error: string } {
+  try {
+    const fullPath = resolveWorkspacePath(workspaceRoot, params.filePath);
+    if (!fs.existsSync(fullPath)) {
+      return { error: `File not found: ${params.filePath}` };
+    }
+
+    const currentContent = fs.readFileSync(fullPath, 'utf8');
+    const target = params.targetContent;
+
+    if (!target) {
+      return { error: 'targetContent cannot be empty.' };
+    }
+
+    if (!currentContent.includes(target)) {
+      return {
+        error: `Target content not found in ${params.filePath}. Ensure exact whitespace, indentation, and newline matching.`,
+      };
+    }
+
+    // Count exact occurrences
+    const occurrences = currentContent.split(target).length - 1;
+    if (occurrences > 1 && !params.allowMultiple) {
+      return {
+        error: `Target content found ${occurrences} times in ${params.filePath}. Provide more surrounding lines of context to target a unique occurrence or set allowMultiple: true.`,
+      };
+    }
+
+    let updatedContent: string;
+    if (params.allowMultiple) {
+      updatedContent = currentContent.split(target).join(params.replacementContent);
+    } else {
+      updatedContent = currentContent.replace(target, params.replacementContent);
+    }
+
+    fs.writeFileSync(fullPath, updatedContent, 'utf8');
+
+    // Invalidate read, list, and grep caches for the workspace — O(k) bounded
+    const cacheKey = buildReadCacheKey(workspaceRoot, params.filePath);
+    readCache.delete(cacheKey);
+    for (const key of listCache.keys()) {
+      if (key.startsWith(path.resolve(workspaceRoot))) {
+        listCache.delete(key);
+      }
+    }
+    // Perf: clear grep cache for workspace — content changed, cached searches stale
+    for (const key of grepCache.keys()) {
+      if (key.startsWith(path.resolve(workspaceRoot))) grepCache.delete(key);
+    }
+
+    return {
+      success: true,
+      filePath: params.filePath,
+      replacementsCount: occurrences,
+    };
+  } catch (err: any) {
+    return { error: `Failed to patch ${params.filePath}: ${err.message}` };
+  }
+}
+
+/**
+ * Searches for exact text or regex patterns across files in the workspace.
+ *
+ * @param workspaceRoot - Absolute workspace root.
+ * @param params - Query string, regex options, file extension, and scope.
+ * @returns `{ matches, totalMatches, count, truncated }` or `{ error }`.
+ *
+ * @example
+ * ```ts
+ * const res = executeGrepSearch(ws, { query: 'formatCurrency', extension: 'ts' });
+ * ```
+ */
+export function executeGrepSearch(
+  workspaceRoot: string,
+  params: GrepSearchParams
+): { matches: GrepMatch[]; totalMatches: number; count: number; truncated: boolean } | { error: string } {
+  try {
+    // Perf: O(1) cache check — repeated grep for same query within 10s returns instantly
+    // WHY: Coverage agent often searches "export function" then "export const" then repeats after failure fix.
+    const grepKey = buildGrepCacheKey(workspaceRoot, params);
+    const cached = grepCache.get(grepKey);
+    if (cached && Date.now() - cached.ts < GREP_CACHE_TTL_MS) {
+      return cached.result; // O(1) Map hit — avoids O(N) file walk
+    }
+
+    const baseDir = params.pathPrefix || '.';
+    const fullBase = resolveWorkspacePath(workspaceRoot, baseDir);
+    if (!fs.existsSync(fullBase)) {
+      return { error: `Directory not found: ${baseDir}` };
+    }
+
+    const maxResults = params.maxResults || 50;
+    const extFilter = params.extension ? `.${params.extension.replace(/^\./, '')}` : null;
+    // Perf: compile regex once O(1) — reused for all files/lines, no per-line recompilation
+    let regex: RegExp;
+    if (params.isRegex) {
+      regex = new RegExp(params.query, params.caseInsensitive ? 'i' : '');
+    } else {
+      const escaped = params.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      regex = new RegExp(escaped, params.caseInsensitive ? 'i' : '');
+    }
+    // Clone for per-line test to avoid lastIndex pollution (if 'g' flag ever added) — O(1)
+    // WHY: Reusing same RegExp with /g advances lastIndex, causing missed matches. Separate instance is safe.
+    const lineRegex = new RegExp(regex.source, regex.flags);
+
+    const matches: GrepMatch[] = [];
+    let totalMatches = 0;
+    const ignoreSet = SHARED_IGNORE_SET; // O(1) Set lookup vs O(n) array
+
+    function walkAndSearch(currentDir: string) {
+      if (matches.length >= maxResults) return; // early exit — O(1) check per dir
+
+      const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      // O(n) where n = entries in dir; ignoreSet.has is O(1) vs includes O(m)
+      for (const entry of entries) {
+        if (ignoreSet.has(entry.name)) continue; // O(1)
+
+        const entryPath = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          walkAndSearch(entryPath);
+        } else if (entry.isFile()) {
+          if (extFilter && !entry.name.endsWith(extFilter)) continue;
+
+          const relPath = path.relative(workspaceRoot, entryPath);
+          try {
+            const content = fs.readFileSync(entryPath, 'utf8');
+            // Perf: O(n) pre-filter — single regex.test on whole content avoids per-line scan for non-matching files
+            // WHY: 80% of files won't contain query; early exit saves O(lines) work. No 'g' flag so test is safe.
+            if (!regex.test(content)) continue;
+
+            const lines = content.split(/\r?\n/);
+            // O(lines) per file — each line checked once with cloned regex
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              // Use cloned regex to avoid stateful lastIndex side-effects
+              if (lineRegex.test(line)) {
+                totalMatches++;
+                if (matches.length < maxResults) {
+                  matches.push({
+                    filePath: relPath,
+                    lineNumber: i + 1,
+                    lineContent: line.length > 200 ? line.slice(0, 200) + '...' : line,
+                  });
+                }
+              } else {
+                // Reset lastIndex in case of global flag edge — O(1)
+                lineRegex.lastIndex = 0;
+              }
+            }
+            // Reset global state after file
+            regex.lastIndex = 0;
+            lineRegex.lastIndex = 0;
+          } catch {
+            // Ignore unreadable or binary files — Do No Harm: never throw for one bad file
+          }
+        }
+      }
+    }
+
+    walkAndSearch(fullBase);
+
+    const result = {
+      matches,
+      totalMatches,
+      count: matches.length,
+      truncated: totalMatches > matches.length,
+    };
+    // Perf: cache result O(1) Map set — bounded LRU prevents leak
+    grepCache.set(grepKey, { ts: Date.now(), result });
+    evictLRU(grepCache, GREP_CACHE_MAX);
+    return result;
+  } catch (err: any) {
+    return { error: `Grep search failed: ${err.message}` };
   }
 }

@@ -47,13 +47,19 @@
 import {
   readFileFunctionDeclaration,
   writeFileFunctionDeclaration,
+  patchFileFunctionDeclaration,
   listDirFunctionDeclaration,
+  grepSearchFunctionDeclaration,
   executeReadFile,
   executeWriteFile,
+  executePatchFile,
   executeListDir,
+  executeGrepSearch,
   ReadFileParams,
   WriteFileParams,
+  PatchFileParams,
   ListDirParams,
+  GrepSearchParams,
 } from './file_ops.js';
 import {
   runCommandFunctionDeclaration,
@@ -79,6 +85,11 @@ import {
   RunSecurityAuditParams,
   SendDigestEmailParams,
 } from './git_digest.js';
+import {
+  getCoverageSummaryFunctionDeclaration,
+  executeGetCoverageSummary,
+  GetCoverageSummaryParams,
+} from './coverage.js';
 import { GitRepoManager } from './repo.js';
 
 /**
@@ -87,15 +98,18 @@ import { GitRepoManager } from './repo.js';
  */
 export const agentToolDeclarations = [
   listDirFunctionDeclaration,
+  grepSearchFunctionDeclaration,
   readFileFunctionDeclaration,
+  getCoverageSummaryFunctionDeclaration,
   writeFileFunctionDeclaration,
+  patchFileFunctionDeclaration,
   runCommandFunctionDeclaration,
   createPrFunctionDeclaration,
 ];
 
 /**
  * Tool declarations available to {@link DailyCommitDigestAgent}.
- * Shares `read_file` / `list_dir` for repo exploration but swaps code‑generation
+ * Shares `read_file` / `list_dir` / `grep_search` for repo exploration but swaps code‑generation
  * tools for the four git‑digest tools.
  */
 export const digestToolDeclarations = [
@@ -105,6 +119,7 @@ export const digestToolDeclarations = [
   sendDigestEmailFunctionDeclaration,
   readFileFunctionDeclaration,
   listDirFunctionDeclaration,
+  grepSearchFunctionDeclaration,
 ];
 
 /**
@@ -129,11 +144,20 @@ export async function executeAgentTool(
     case 'list_dir':
       return executeListDir(workspaceRoot, args as ListDirParams);
 
+    case 'grep_search':
+      return executeGrepSearch(workspaceRoot, args as GrepSearchParams);
+
     case 'read_file':
       return executeReadFile(workspaceRoot, args as ReadFileParams);
 
+    case 'get_coverage_summary':
+      return await executeGetCoverageSummary(workspaceRoot, args as GetCoverageSummaryParams);
+
     case 'write_file':
       return executeWriteFile(workspaceRoot, args as WriteFileParams);
+
+    case 'patch_file':
+      return executePatchFile(workspaceRoot, args as PatchFileParams);
 
     case 'run_command':
       return await executeRunCommand(workspaceRoot, args as RunCommandParams);
@@ -187,6 +211,9 @@ export async function executeDigestTool(
     case 'list_dir':
       return executeListDir(workspaceRoot, args as ListDirParams);
 
+    case 'grep_search':
+      return executeGrepSearch(workspaceRoot, args as GrepSearchParams);
+
     default:
       return { error: `Unrecognized digest tool: ${toolName}` };
   }
@@ -194,6 +221,7 @@ export async function executeDigestTool(
 
 export * from './file_ops.js';
 export * from './command_runner.js';
+export * from './coverage.js';
 export * from './github_pr.js';
 export * from './git_digest.js';
 export * from './repo.js';

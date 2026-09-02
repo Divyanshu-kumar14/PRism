@@ -152,11 +152,11 @@ export class CoverageAgent {
       options.focusArea
         ? `Focus on increasing test coverage for: ${options.focusArea}. Analyze the code, create/update test files, run tests to verify they pass, and open a PR.`
         : `Your mission is to increase test coverage of the codebase.
-1. Explore the project structure using list_dir and read package.json / key source files.
-2. Identify important untested modules, utilities, hooks, business logic, or schemas.
-3. Write high-quality, comprehensive unit or integration tests covering normal paths and edge cases.
-4. Execute test commands using run_command (e.g. "npx vitest run" or "npm test") to ensure all tests pass cleanly. If tests fail, fix them immediately.
-5. Once all tests are passing and verified, open a Pull Request using create_pr with a detailed breakdown of the tests added and coverage gained.`
+1. Explore the project structure using list_dir, grep_search, and read package.json / key source files.
+2. Run tests with coverage (e.g. "npx vitest run --coverage" or "npm test -- --coverage") and call get_coverage_summary to pinpoint untested modules and exact uncovered lines.
+3. Write high-quality, comprehensive unit or integration tests using write_file or patch_file covering normal paths and uncovered edge cases.
+4. Re-run test and coverage commands to verify that all tests pass 100% cleanly and test coverage has increased.
+5. Once all tests are passing and coverage gains are verified, open a Pull Request using create_pr with a detailed breakdown of the tests added and coverage gained.`
     );
 
     return await this.chat(missionPrompt, workspaceRoot);
@@ -200,9 +200,12 @@ Guidelines:
 1. Workspace: You have direct access to the cloned repository workspace via tools.
 2. Tool Usage:
    - Use list_dir to inspect directories and find source code files.
+   - Use grep_search to quickly search for function names, classes, types, exports, and imports across the repository.
    - Use read_file to inspect source code and understand requirements, exports, types, and logic.
+   - Use get_coverage_summary to inspect coverage reports and identify exact uncovered line ranges.
    - Use write_file to create new test files (e.g., in a tests/ directory or co-located *.test.ts files).
-   - Use run_command to run test runners (e.g., "npx vitest run", "npm test", "npx jest", or installing test utilities if required), typechecks ("npx tsc --noEmit"), and check git status.
+   - Use patch_file to make surgical updates or fixes to existing files without rewriting them entirely.
+   - Use run_command to run test runners (e.g., "npx vitest run --coverage", "npm test", "npx jest", or installing test utilities if required), typechecks ("npx tsc --noEmit"), and check git status.
    - ALWAYS verify your tests by running them through run_command before concluding. Tests MUST pass 100% without errors.
    - Once tests are passing and coverage is verified, call create_pr to submit a Pull Request with a clear title and informative Markdown description.
 3. High Quality Tests:
