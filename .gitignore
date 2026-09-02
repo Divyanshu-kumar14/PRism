@@ -11,4 +11,4 @@ workspace/
 repos/
 reports/
 .token-optimizer
-workspace/*s
+coverage/
