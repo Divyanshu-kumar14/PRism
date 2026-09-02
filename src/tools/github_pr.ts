@@ -61,6 +61,12 @@ export interface CreatePrParams {
   branchName?: string;
   /** Custom git commit message. Defaults to `title`. */
   commitMessage?: string;
+  /** Whether to create the Pull Request as a Draft. Defaults to false. */
+  draft?: boolean;
+  /** Optional array of GitHub label names to attach to the PR (e.g. `["tests", "automated-pr"]`). */
+  labels?: string[];
+  /** Optional GitHub Issue number to link (e.g. `42` -> appends `Closes #42` to body). */
+  linkedIssueNumber?: number;
 }
 
 /**
@@ -89,6 +95,19 @@ export const createPrFunctionDeclaration: FunctionDeclaration = {
         type: 'string',
         description: 'Optional git commit message. Defaults to the PR title.',
       },
+      draft: {
+        type: 'boolean',
+        description: 'Whether to open the PR as a draft. Defaults to false.',
+      },
+      labels: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Optional list of label names to attach to the PR (e.g. ["automated-pr", "test-coverage"]).',
+      },
+      linkedIssueNumber: {
+        type: 'integer',
+        description: 'Optional GitHub Issue number to link and close automatically upon PR merge.',
+      },
     },
     required: ['title', 'body'],
   },
@@ -98,18 +117,32 @@ export const createPrFunctionDeclaration: FunctionDeclaration = {
  * Commits, pushes, and opens a GitHub Pull Request.
  *
  * @param repoManager - Workspace manager that performs `checkout -B` / `add -A` / `commit` / `push`.
- * @param params - Title, body, optional branch/commit overrides.
+ * @param params - Title, body, optional branch/commit overrides, draft mode, and labels.
  * @returns `{ success, prUrl?, prNumber?, branch?, message }`.
  *   On failure `success` is `false` and `message` explains the cause (never throws to the agent unhandled,
  *   but transport errors are caught and wrapped).
  *
  * @example
  * ```ts
- * const res = await executeCreatePr(mgr, { title: 'test: coverage', body: '...' });
+ * const res = await executeCreatePr(mgr, {
+ *   title: 'test: coverage',
+ *   body: '...',
+ *   labels: ['automated-pr', 'tests'],
+ *   draft: false,
+ * });
  * if (res.success) console.log(`→ ${res.prUrl}`);
  * else console.error(res.message);
  * ```
  */
+export function buildPrBody(body: string, linkedIssueNumber?: number): string {
+  let finalBody = body;
+  if (linkedIssueNumber && typeof linkedIssueNumber === 'number') {
+    finalBody += `\n\nCloses #${linkedIssueNumber}`;
+  }
+  finalBody += '\n\n---\n*Created automatically by [PRism](https://github.com/Divyanshu-kumar14/PRism) AI Test Coverage Agent.*';
+  return finalBody;
+}
+
 export async function executeCreatePr(
   repoManager: GitRepoManager,
   params: CreatePrParams
@@ -132,6 +165,17 @@ export async function executeCreatePr(
 
     console.log(`\x1b[35m[GitHub PR]\x1b[0m Creating Pull Request against \x1b[32m${owner}/${repo}:${config.targetBranch}\x1b[0m...`);
 
+    const prPayload: Record<string, any> = {
+      title: params.title,
+      body: buildPrBody(params.body, params.linkedIssueNumber),
+      head: branchName,
+      base: config.targetBranch,
+    };
+
+    if (params.draft !== undefined) {
+      prPayload.draft = params.draft;
+    }
+
     const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
       method: 'POST',
       headers: {
@@ -141,12 +185,7 @@ export async function executeCreatePr(
         'Content-Type': 'application/json',
         'User-Agent': 'PRism-Agent/1.0',
       },
-      body: JSON.stringify({
-        title: params.title,
-        body: params.body + '\n\n---\n*Created automatically by [PRism](https://github.com/Divyanshu-kumar14/PRism) AI Test Coverage Agent.*',
-        head: branchName,
-        base: config.targetBranch,
-      }),
+      body: JSON.stringify(prPayload),
     });
 
     const data = (await response.json()) as any;
@@ -159,7 +198,27 @@ export async function executeCreatePr(
       };
     }
 
-    console.log(`\x1b[32m[GitHub PR Success]\x1b[0m Pull Request #${data.number} created: ${data.html_url}`);
+    const prNumber = data.number;
+    console.log(`\x1b[32m[GitHub PR Success]\x1b[0m Pull Request #${prNumber} created: ${data.html_url}`);
+
+    // If labels were requested, apply them via the issues/labels API endpoint
+    if (params.labels && Array.isArray(params.labels) && params.labels.length > 0) {
+      try {
+        await fetch(`https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/labels`, {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/vnd.github+json',
+            'Authorization': `Bearer ${token}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+            'User-Agent': 'PRism-Agent/1.0',
+          },
+          body: JSON.stringify({ labels: params.labels }),
+        });
+      } catch (labelErr: any) {
+        console.warn(`\x1b[33m[GitHub PR Warning]\x1b[0m Failed to attach labels to PR #${prNumber}: ${labelErr.message}`);
+      }
+    }
 
     return {
       success: true,
