@@ -1,0 +1,90 @@
+# =============================================================================
+# PRism — .dockerignore
+# =============================================================================
+# What it does:
+# - Prevents sending unnecessary/host-specific files to the Docker daemon
+#   (faster `docker build`, smaller context, no secret leaks).
+# - Mirrors .gitignore plus Docker-specific exclusions (see comments).
+#
+# Gotchas:
+# - .env is NEVER copied — container must receive env via `--env-file` or
+#   `env_file:` in compose. If you `COPY .env` the secret leaks into layer history.
+# - `dist/` is ignored here because the builder stage recompiles from `src/` —
+#   stale local `dist/` never pollutes the image.
+# - Keep `package.json` + `package-lock.json` (required for `npm ci`).
+# =============================================================================
+
+# --- Dependencies & build outputs (rebuilt in image) ---
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp
+.pnp.js
+dist
+build
+out
+.next
+.turbo
+.cache
+
+# --- Secrets & local env (CRITICAL: never bake into image) ---
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+*.pem
+*.key
+
+# --- Git & OS artifacts ---
+.git
+.gitignore
+.gitattributes
+.github
+.DS_Store
+Thumbs.db
+*.log
+*~
+
+# --- Workspace & reports (ephemeral at runtime — mount as volumes) ---
+workspace
+workspace/
+repos
+reports
+coverage
+.nyc_output
+.coverage
+*.lcov
+lcov.info
+
+# --- Dev & CI artifacts (not needed at runtime) ---
+.vscode
+.idea
+*.swp
+*.swo
+.token-optimizer
+.adk
+coverage
+tests
+vitest.config.ts
+eslint.config.*
+.prettierrc*
+docker-compose.override.yml
+# NOTE: tsconfig.json + src/ are intentionally NOT ignored — required for builder stage `npm run build`
+
+# --- Docs & examples (keep README.md for reference, ignore rest) ---
+# README.md is intentionally NOT ignored — copied to /app for debugging
+# LICENSE is also kept
+*.md
+!README.md
+
+# --- Docker itself (avoid recursive copy) ---
+Dockerfile
+.dockerignore
+docker-compose*.yml
+.docker
+
+# --- Misc ---
+tmp
+temp

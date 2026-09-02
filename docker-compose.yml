@@ -1,0 +1,86 @@
+# =============================================================================
+# PRism — docker-compose.yml
+# =============================================================================
+# What it does:
+# - Runs the 22:00 IST scheduler daemon with restart policy (survives reboots)
+# - Mounts named volumes for reports/ + workspace/ so digests survive `docker compose down`
+# - Injects env via .env file (never baked into image — see .dockerignore)
+#
+# Key configs:
+# - `env_file: .env` — single source of truth (same as `npm run schedule`)
+# - `volumes` — persistent: reports (HTML digests) + workspace (git clones)
+# - `restart: unless-stopped` — daemon survives host reboot until `docker compose stop`
+#
+# Usage:
+#   cp .env.example .env && nano .env   # set GEMINI_API_KEY, GITHUB_TOKEN, etc.
+#   docker compose up -d --build        # build + start daemon
+#   docker compose logs -f               # watch 10pm trigger logs
+#   docker compose exec prism node dist/digest_cli.js -- --since 7d  # one-shot digest
+#   docker compose exec prism node dist/index.js -- --focus src/lib  # one-shot tester
+#   docker compose down                 # stop (volumes kept)
+#   docker compose down -v              # stop + wipe reports/workspace (fresh)
+#
+# Edge cases:
+# - If you change DIGEST_CRON_SCHEDULE, `docker compose restart` is required (node-cron reads at boot).
+# - For one-shot jobs without daemon, use `docker compose run --rm`:
+#     docker compose run --rm prism node dist/digest_cli.js -- --since 24h --to you@example.com
+# =============================================================================
+
+services:
+  prism:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: prism:latest
+    container_name: prism
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Ensure TZ is UTC inside container; node-cron uses DIGEST_TIMEZONE (Asia/Kolkata) for scheduling,
+      # but host logs are clearer in UTC. Override if you want host-local logs.
+      TZ: UTC
+      NODE_ENV: production
+    volumes:
+      # Persistent named volumes — survive container rebuilds
+      - prism_reports:/app/reports
+      - prism_workspace:/app/workspace
+      # Optional: mount coverage if you run `get_coverage_summary` against host workspace
+      # - prism_coverage:/app/coverage
+    # No ports — scheduler is cron-only. Uncomment if you add an HTTP health endpoint.
+    # ports:
+    #   - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(require('fs').existsSync('/app/dist/scheduler.js') ? 0 : 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Graceful SIGTERM via tini (see Dockerfile ENTRYPOINT)
+    init: false  # tini already in Dockerfile; set true only if you remove ENTRYPOINT
+    # Resource limits — adjust for your VPS (Gemini calls are network-bound, not CPU)
+    # deploy:
+    #   resources:
+    #     limits: { cpus: '1.0', memory: 1G }
+    #     reservations: { cpus: '0.5', memory: 512M }
+
+  # Optional: one-shot runner profile — `docker compose --profile tools run --rm tester`
+  # tester:
+  #   extends: prism
+  #   profiles: ["tools"]
+  #   restart: "no"
+  #   command: ["node", "dist/index.js", "--help"]
+  #   volumes:
+  #     - prism_reports:/app/reports
+  #     - prism_workspace:/app/workspace
+
+volumes:
+  prism_reports:
+    name: prism_reports
+    driver: local
+  prism_workspace:
+    name: prism_workspace
+    driver: local
+  # prism_coverage:
+  #   name: prism_coverage
+
