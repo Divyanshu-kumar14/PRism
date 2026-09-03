@@ -1,6 +1,6 @@
 {
   "name": "prism-agent",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Three autonomous agents — Tester, Sentinel & Healer — powered by Google Gemini: coverage PRs, daily digests, and CI auto-fixes",
   "main": "dist/index.js",
   "type": "module",
