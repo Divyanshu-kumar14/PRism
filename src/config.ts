@@ -73,6 +73,12 @@ export const AppConfigSchema = z.object({
   // Scheduling
   cronSchedule: z.string().min(1).default('0 22 * * *'),
   cronTimezone: z.string().min(1).default('Asia/Kolkata'),
+
+  // Healer (CI auto-fix)
+  healerEnabled: z.boolean().default(false),
+  healerMaxAttempts: z.number().int().min(1).max(5).default(3),
+  healerAllowPush: z.boolean().default(false),
+  healerWebhookPort: z.number().int().min(1).max(65535).default(8787),
 });
 
 /**
@@ -125,6 +131,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // Schedule
     cronSchedule: env.DIGEST_CRON_SCHEDULE || '0 22 * * *',
     cronTimezone: env.DIGEST_TIMEZONE || 'Asia/Kolkata',
+
+    // Healer
+    healerEnabled: env.HEALER_ENABLED === 'true',
+    healerMaxAttempts: parseInt(env.HEALER_MAX_ATTEMPTS || '3', 10),
+    healerAllowPush: env.HEALER_ALLOW_PUSH === 'true',
+    healerWebhookPort: parseInt(env.HEALER_WEBHOOK_PORT || '8787', 10),
   };
 
   const parsed = AppConfigSchema.safeParse(rawConfig);
