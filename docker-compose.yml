@@ -1,15 +1,18 @@
 # =============================================================================
-# PRism — docker-compose.yml
+# PRism — docker-compose.yml (Three Agents: Tester, Sentinel, Healer)
 # =============================================================================
 # What it does:
 # - Runs the 22:00 IST scheduler daemon with restart policy (survives reboots)
 # - Mounts named volumes for reports/ + workspace/ so digests survive `docker compose down`
 # - Injects env via .env file (never baked into image — see .dockerignore)
+# - Healer webhook (optional): set HEALER_ENABLED=true + HEALER_WEBHOOK_PORT=8787 to
+#   auto-heal red PRs via webhook or CLI. Healer respects HEALER_ALLOW_PUSH guard.
 #
 # Key configs:
 # - `env_file: .env` — single source of truth (same as `npm run schedule`)
 # - `volumes` — persistent: reports (HTML digests) + workspace (git clones)
 # - `restart: unless-stopped` — daemon survives host reboot until `docker compose stop`
+# - Healer: `HEALER_ENABLED`, `HEALER_MAX_ATTEMPTS`, `HEALER_ALLOW_PUSH`, `HEALER_WEBHOOK_PORT`
 #
 # Usage:
 #   cp .env.example .env && nano .env   # set GEMINI_API_KEY, GITHUB_TOKEN, etc.
@@ -17,13 +20,17 @@
 #   docker compose logs -f               # watch 10pm trigger logs
 #   docker compose exec prism node dist/digest_cli.js -- --since 7d  # one-shot digest
 #   docker compose exec prism node dist/index.js -- --focus src/lib  # one-shot tester
+#   docker compose exec prism node dist/healer_cli.js -- --pr 42 --branch feat/x --command "npm test" --allow-push  # heal PR
+#   docker compose exec prism node dist/healer_cli.js -- --command "npx tsc --noEmit"  # heal typecheck
 #   docker compose down                 # stop (volumes kept)
 #   docker compose down -v              # stop + wipe reports/workspace (fresh)
 #
 # Edge cases:
 # - If you change DIGEST_CRON_SCHEDULE, `docker compose restart` is required (node-cron reads at boot).
+# - For Healer webhook, expose HEALER_WEBHOOK_PORT and set HEALER_ENABLED=true then `docker compose up -d --build`.
 # - For one-shot jobs without daemon, use `docker compose run --rm`:
 #     docker compose run --rm prism node dist/digest_cli.js -- --since 24h --to you@example.com
+#     docker compose run --rm prism node dist/healer_cli.js -- --command "npm test"
 # =============================================================================
 
 services:
@@ -47,11 +54,13 @@ services:
       - prism_workspace:/app/workspace
       # Optional: mount coverage if you run `get_coverage_summary` against host workspace
       # - prism_coverage:/app/coverage
-    # No ports — scheduler is cron-only. Uncomment if you add an HTTP health endpoint.
+    # Ports — uncomment for Healer webhook or health endpoint
+    # Healer webhook listener (when HEALER_ENABLED=true). Maps container 8787 to host 8787.
     # ports:
+    #   - "${HEALER_WEBHOOK_PORT:-8787}:8787"
     #   - "3000:3000"
     healthcheck:
-      test: ["CMD", "node", "-e", "process.exit(require('fs').existsSync('/app/dist/scheduler.js') ? 0 : 1)"]
+      test: ["CMD", "node", "-e", "process.exit(require('fs').existsSync('/app/dist/scheduler.js') && require('fs').existsSync('/app/dist/healer_cli.js') ? 0 : 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -64,12 +73,20 @@ services:
     #     limits: { cpus: '1.0', memory: 1G }
     #     reservations: { cpus: '0.5', memory: 512M }
 
-  # Optional: one-shot runner profile — `docker compose --profile tools run --rm tester`
+  # Optional: one-shot runner profiles — `docker compose --profile tools run --rm <svc>`
   # tester:
   #   extends: prism
   #   profiles: ["tools"]
   #   restart: "no"
   #   command: ["node", "dist/index.js", "--help"]
+  #   volumes:
+  #     - prism_reports:/app/reports
+  #     - prism_workspace:/app/workspace
+  # healer:
+  #   extends: prism
+  #   profiles: ["tools"]
+  #   restart: "no"
+  #   command: ["node", "dist/healer_cli.js", "--help"]
   #   volumes:
   #     - prism_reports:/app/reports
   #     - prism_workspace:/app/workspace
