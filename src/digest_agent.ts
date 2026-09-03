@@ -63,10 +63,17 @@ import {
 } from './tools/index.js';
 import { MailerService, CommitSummaryItem } from './services/mailer.js';
 
-/** Gemini‑style content block (kept loose as `any[]` to track SDK changes without churn). */
+export interface DigestAgentPart {
+  text?: string;
+  functionCall?: { name: string; args?: Record<string, unknown> };
+  functionResponse?: { name: string; response: unknown };
+  thought?: boolean;
+}
+
+/** Gemini‑style content block (kept loose as `unknown[]` to track SDK changes without churn). */
 export interface DigestAgentMessage {
   role: 'user' | 'model';
-  parts: any[];
+  parts: DigestAgentPart[];
 }
 
 /**
@@ -233,28 +240,31 @@ Guidelines:
 
       // Retry wrapper for 429 RESOURCE_EXHAUSTED — free tier may still spike
       // WHY: Even with throttle, concurrent scheduler + manual digest can exceed 5 RPM; retry after RetryInfo delay.
-      let response: any;
+      let response: { candidates?: Array<{ content?: { parts?: DigestAgentPart[] } }>; text?: string } | undefined;
       let attempt = 0;
       while (true) {
         try {
           this.lastGeminiCallMs = Date.now();
-          response = await this.client.models.generateContent({
+          response = (await this.client.models.generateContent({
             model: this.model,
-            contents: this.history,
+            contents: this.history as unknown as never,
             config: {
               systemInstruction,
               tools,
             },
-          });
+          })) as unknown as { candidates?: Array<{ content?: { parts?: DigestAgentPart[] } }>; text?: string };
           break; // success
-        } catch (err: any) {
-          const msg = err?.message || '';
-          const is429 = err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          const errStatus = (err as { status?: number })?.status;
+          const msg = errorMessage || '';
+          const is429 = errStatus === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
           const retryMatch = msg.match(/retryDelay.*?(\d+)s/i) || msg.match(/Please retry in (\d+)/i);
           const retrySec = retryMatch ? parseInt(retryMatch[1], 10) : 50;
           if (is429 && attempt < 2) {
             attempt++;
-            const waitMs = (retrySec + 2) * 1000;
+            const RETRY_BUFFER_SECONDS = 2;
+            const waitMs = (retrySec + RETRY_BUFFER_SECONDS) * 1000;
             console.warn(`\x1b[33m⚠️  Gemini 429 quota hit (attempt ${attempt}/2) — waiting ${retrySec}s then retrying...\x1b[0m`);
             await sleep(waitMs);
             continue;
@@ -272,7 +282,7 @@ Guidelines:
       this.history.push(modelContent as DigestAgentMessage);
 
       // Print any model reasoning
-      const textParts = candidate.content.parts?.filter((p: any) => p.text);
+      const textParts = candidate.content.parts?.filter((p: DigestAgentPart) => p.text);
       if (textParts && textParts.length > 0) {
         for (const p of textParts) {
           if (p.text && typeof p.text === 'string' && p.text.trim()) {
@@ -282,7 +292,7 @@ Guidelines:
       }
 
       // Check function calls
-      const functionCalls = candidate.content.parts?.filter((p: any) => p.functionCall);
+      const functionCalls = candidate.content.parts?.filter((p: DigestAgentPart) => p.functionCall);
       if (!functionCalls || functionCalls.length === 0) {
         return response.text || '(Daily Digest Mission concluded)';
       }
@@ -303,8 +313,9 @@ Guidelines:
           );
 
           // If commits were fetched, cache them for email rendering
-          if (toolName === 'get_recent_commits' && toolResult.commits) {
-            this.cachedCommits = toolResult.commits;
+          const toolResultRecord = toolResult as { commits?: CommitSummaryItem[] };
+          if (toolName === 'get_recent_commits' && toolResultRecord.commits) {
+            this.cachedCommits = toolResultRecord.commits;
           }
 
           const summaryStr = JSON.stringify(toolResult);
@@ -317,12 +328,12 @@ Guidelines:
               response: toolResult,
             },
           });
-        } catch (err: any) {
-          console.error(`\x1b[31m✖ [Tool Error]\x1b[0m ${err.message}`);
+        } catch (err: unknown) {
+          console.error(`\x1b[31m✖ [Tool Error]\x1b[0m ${err instanceof Error ? err.message : String(err)}`);
           functionResponseParts.push({
             functionResponse: {
               name: toolName,
-              response: { error: err.message },
+              response: { error: (err instanceof Error ? err.message : String(err)) },
             },
           });
         }

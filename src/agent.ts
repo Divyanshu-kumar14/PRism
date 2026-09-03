@@ -122,10 +122,17 @@ const sleepCov = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ── AgentMessage & RunMissionOptions ─────────────────────────────────────
 
-/** Gemini‑style content block the SDK expects (thinly typed; SDK drift is tolerated as `any`). */
+export interface AgentPart {
+  text?: string;
+  functionCall?: { name: string; args?: Record<string, unknown> };
+  functionResponse?: { name: string; response: unknown };
+  thought?: boolean;
+}
+
+/** Gemini‑style content block the SDK expects (thinly typed; SDK drift guarded via AgentPart). */
 export interface AgentMessage {
   role: 'user' | 'model';
-  parts: any[];
+  parts: AgentPart[];
 }
 
 /**
@@ -281,15 +288,15 @@ export class CoverageAgent {
       }
 
       return result;
-    } catch (error: any) {
+    } catch (error: unknown) {
       // Finalize mission metrics on error
       const missionEndTime = Date.now();
       if (this.currentMissionMetrics) {
         this.currentMissionMetrics.endTime = missionEndTime;
         this.currentMissionMetrics.totalDurationMs = missionEndTime - this.missionStartTime;
         this.currentMissionMetrics.success = false;
-        this.currentMissionMetrics.finalError = error.message || String(error);
-        console.error(`\x1b[31m[Telemetry]\x1b[0m Mission failed: ${missionId} after ${formatDuration(this.currentMissionMetrics.totalDurationMs)} — ${error.message}`);
+        this.currentMissionMetrics.finalError = (error instanceof Error ? error.message : String(error));
+        console.error(`\x1b[31m[Telemetry]\x1b[0m Mission failed: ${missionId} after ${formatDuration(this.currentMissionMetrics.totalDurationMs)} — ${error instanceof Error ? error.message : String(error)}`);
       }
       throw error;
     }
@@ -315,7 +322,7 @@ export class CoverageAgent {
    * **Gotchas**
    * - `systemInstruction` enforces test quality (no fake `assert(true)`) and the `run_command` → `create_pr`
    *   verification contract. Tweaking it is the primary lever for agent quality.
-   * - Tool errors are fed back as `{ error: err.message }` function responses so the LLM can self‑fix.
+   * - Tool errors are fed back as `{ error: (err instanceof Error ? err.message : String(err)) }` function responses so the LLM can self‑fix.
    */
   public async chat(userMessage: string, workspaceRootOverride?: string): Promise<string> {
     const workspaceRoot = workspaceRootOverride || this.repoManager.getWorkspacePath();
@@ -381,28 +388,32 @@ Guidelines:
         await sleepCov(waitMs);
       }
 
-      let response: any;
+      let response: { candidates?: Array<{ content?: { parts?: AgentPart[] } }>; text?: string } | undefined;
       let attempt = 0;
       while (true) {
         try {
           this.lastGeminiCallMs = Date.now();
-          response = await this.client.models.generateContent({
+          response = (await this.client.models.generateContent({
             model: this.model,
-            contents: this.history,
+            // Cast to accommodate SDK Content type while keeping our typed AgentMessage
+            contents: this.history as unknown as never,
             config: {
               systemInstruction,
               tools,
             },
-          });
+          })) as unknown as { candidates?: Array<{ content?: { parts?: AgentPart[] } }>; text?: string };
           break;
-        } catch (err: any) {
-          const msg = err?.message || '';
-          const is429 = err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          const errStatus = (err as { status?: number })?.status;
+          const msg = errorMessage || '';
+          const is429 = errStatus === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
           const retryMatch = msg.match(/retryDelay.*?(\d+)s/i) || msg.match(/Please retry in (\d+)/i);
           const retrySec = retryMatch ? parseInt(retryMatch[1], 10) : 50;
           if (is429 && attempt < 2) {
             attempt++;
-            const waitMs = (retrySec + 2) * 1000;
+            const RETRY_BUFFER_SECONDS = 2;
+            const waitMs = (retrySec + RETRY_BUFFER_SECONDS) * 1000;
             console.warn(`\x1b[33m⚠️  Gemini 429 — waiting ${retrySec}s (attempt ${attempt}/2)...\x1b[0m`);
             await sleepCov(waitMs);
             continue;
@@ -424,7 +435,7 @@ Guidelines:
       this.history.push(modelContent as AgentMessage);
 
       // Print any model reasoning/text thought
-      const textParts = candidate.content.parts?.filter((p: any) => p.text);
+      const textParts = candidate.content.parts?.filter((p: AgentPart) => p.text);
       if (textParts && textParts.length > 0) {
         for (const p of textParts) {
           if (p.text && typeof p.text === 'string' && p.text.trim()) {
@@ -437,7 +448,7 @@ Guidelines:
       }
 
       // 3. Check for function calls
-      const functionCalls = candidate.content.parts?.filter((p: any) => p.functionCall);
+      const functionCalls = candidate.content.parts?.filter((p: AgentPart) => p.functionCall);
 
       if (!functionCalls || functionCalls.length === 0) {
         // No function calls: agent completed its response
@@ -466,13 +477,13 @@ Guidelines:
 
         console.log(`\x1b[36m⚙️ [Tool Call]\x1b[0m \x1b[1m${toolName}\x1b[0m(${JSON.stringify(call.args)})`);
 
-        let toolResult: any;
+        let toolResult: unknown;
         let toolError: string | undefined;
 
         try {
           toolResult = await executeAgentTool(
             toolName,
-            call.args,
+            call.args as unknown,
             workspaceRoot,
             this.repoManager
           );
@@ -508,10 +519,10 @@ Guidelines:
               response: toolResult,
             },
           });
-        } catch (err: any) {
+        } catch (err: unknown) {
           const toolEndTime = Date.now();
           const toolDurationMs = toolEndTime - toolStartTime;
-          toolError = err.message;
+          toolError = (err instanceof Error ? err.message : String(err));
 
           // Record failed tool call metrics
           const toolMetric: ToolCallMetric = {

@@ -136,10 +136,10 @@ export const digestToolDeclarations = [
  */
 export async function executeAgentTool(
   toolName: string,
-  args: any,
+  args: unknown,
   workspaceRoot: string,
   repoManager: GitRepoManager
-): Promise<any> {
+): Promise<unknown> {
   switch (toolName) {
     case 'list_dir':
       return executeListDir(workspaceRoot, args as ListDirParams);
@@ -186,12 +186,21 @@ export async function executeAgentTool(
  * await executeDigestTool('send_digest_email', { reportDate: '…', … }, ws, commits.commits);
  * ```
  */
+export interface DigestCommitInfo {
+  hash: string;
+  shortHash: string;
+  author: string;
+  email: string;
+  date: string;
+  message: string;
+}
+
 export async function executeDigestTool(
   toolName: string,
-  args: any,
+  args: unknown,
   workspaceRoot: string,
-  cachedCommits: any[] = []
-): Promise<any> {
+  cachedCommits: DigestCommitInfo[] = []
+): Promise<unknown> {
   switch (toolName) {
     case 'get_recent_commits':
       return await executeGetRecentCommits(workspaceRoot, args as GetRecentCommitsParams);

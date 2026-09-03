@@ -165,7 +165,7 @@ export async function executeCreatePr(
 
     console.log(`\x1b[35m[GitHub PR]\x1b[0m Creating Pull Request against \x1b[32m${owner}/${repo}:${config.targetBranch}\x1b[0m...`);
 
-    const prPayload: Record<string, any> = {
+    const prPayload: Record<string, unknown> = {
       title: params.title,
       body: buildPrBody(params.body, params.linkedIssueNumber),
       head: branchName,
@@ -188,7 +188,14 @@ export async function executeCreatePr(
       body: JSON.stringify(prPayload),
     });
 
-    const data = (await response.json()) as any;
+    interface GitHubPrApiResponse {
+      number: number;
+      html_url: string;
+      message?: string;
+      errors?: unknown;
+    }
+
+    const data = (await response.json()) as GitHubPrApiResponse;
 
     if (!response.ok) {
       const errorDetail = data.errors ? JSON.stringify(data.errors) : (data.message || response.statusText);
@@ -215,8 +222,9 @@ export async function executeCreatePr(
           },
           body: JSON.stringify({ labels: params.labels }),
         });
-      } catch (labelErr: any) {
-        console.warn(`\x1b[33m[GitHub PR Warning]\x1b[0m Failed to attach labels to PR #${prNumber}: ${labelErr.message}`);
+      } catch (labelErr: unknown) {
+        const labelErrorMessage = labelErr instanceof Error ? labelErr.message : String(labelErr);
+        console.warn(`\x1b[33m[GitHub PR Warning]\x1b[0m Failed to attach labels to PR #${prNumber}: ${labelErrorMessage}`);
       }
     }
 
@@ -227,10 +235,11 @@ export async function executeCreatePr(
       branch: branchName,
       message: `Pull Request #${data.number} created successfully: ${data.html_url}`,
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
     return {
       success: false,
-      message: `Failed to create Pull Request: ${err.message}`,
+      message: `Failed to create Pull Request: ${errorMessage}`,
     };
   }
 }

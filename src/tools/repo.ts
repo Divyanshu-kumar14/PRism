@@ -174,8 +174,8 @@ export class GitRepoManager {
           success: true,
           message: `Workspace updated successfully to latest origin/${this.baseBranch}`,
         };
-      } catch (err: any) {
-        console.warn(`\x1b[33m[Git Warning]\x1b[0m Failed to update existing repo (${err.message}). Re-cloning fresh workspace...`);
+      } catch (err: unknown) {
+        console.warn(`\x1b[33m[Git Warning]\x1b[0m Failed to update existing repo (${err instanceof Error ? err.message : String(err)}). Re-cloning fresh workspace...`);
         fs.rmSync(this.workspacePath, { recursive: true, force: true });
       }
     }

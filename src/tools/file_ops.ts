@@ -436,8 +436,8 @@ export function executeReadFile(workspaceRoot: string, params: ReadFileParams): 
       startLine: start,
       endLine: end,
     };
-  } catch (err: any) {
-    return { error: `Failed to read ${params.filePath}: ${err.message}` };
+  } catch (err: unknown) {
+    return { error: `Failed to read ${params.filePath}: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -501,8 +501,8 @@ export function executeWriteFile(workspaceRoot: string, params: WriteFileParams)
       filePath: params.filePath,
       bytesWritten: Buffer.byteLength(params.content, 'utf8'),
     };
-  } catch (err: any) {
-    return { error: `Failed to write ${params.filePath}: ${err.message}` };
+  } catch (err: unknown) {
+    return { error: `Failed to write ${params.filePath}: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -600,8 +600,8 @@ export function executeListDir(workspaceRoot: string, params: ListDirParams): { 
     listCache.set(cacheKey, { ts: Date.now(), result });
     evictLRU(listCache, LIST_CACHE_MAX);
     return result;
-  } catch (err: any) {
-    return { error: `Failed to list directory: ${err.message}` };
+  } catch (err: unknown) {
+    return { error: `Failed to list directory: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -685,8 +685,8 @@ export function executePatchFile(
       filePath: params.filePath,
       replacementsCount: occurrences,
     };
-  } catch (err: any) {
-    return { error: `Failed to patch ${params.filePath}: ${err.message}` };
+  } catch (err: unknown) {
+    return { error: `Failed to patch ${params.filePath}: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -893,7 +893,7 @@ export function executeGrepSearch(
     grepCache.set(grepKey, { ts: Date.now(), result });
     evictLRU(grepCache, GREP_CACHE_MAX);
     return result;
-  } catch (err: any) {
-    return { error: `Grep search failed: ${err.message}` };
+  } catch (err: unknown) {
+    return { error: `Grep search failed: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
