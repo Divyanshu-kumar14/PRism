@@ -1,7 +1,7 @@
 {
   "name": "prism-agent",
   "version": "0.1.0",
-  "description": "Autonomous Codebase Test Coverage & PR Agent powered by Google Gemini and TypeScript",
+  "description": "Three autonomous agents — Tester, Sentinel & Healer — powered by Google Gemini: coverage PRs, daily digests, and CI auto-fixes",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {

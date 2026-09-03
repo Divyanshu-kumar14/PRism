@@ -2,7 +2,7 @@
   <br />
   <span style="font-size: 48px">🔮</span>
   <h1 align="center">PRism</h1>
-  <p align="center"><strong>Your Repo's Autonomous Teammate</strong><br />Two AI agents. One repo. Zero manual busywork.</p>
+  <p align="center"><strong>Your Repo's Autonomous Teammate</strong><br />Three AI agents. One repo. Zero manual busywork.</p>
   <p align="center">
     <a href="https://github.com/Divyanshu-kumar14/PRism"><img src="https://img.shields.io/badge/status-active-brightgreen?style=flat-square" alt="status" /></a>
     <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="typescript" />
@@ -31,7 +31,7 @@
 
 <table>
 <tr>
-<td width="50%">
+<td width="33%">
 
 #### 🧪 The Tester — Coverage Agent
 Finds untested code, writes real tests, runs them until green, and opens a PR — with surgical patches, grep search, and coverage-aware prioritization.
@@ -39,7 +39,7 @@ Finds untested code, writes real tests, runs them until green, and opens a PR �
 `npm run coverage-job`
 
 </td>
-<td width="50%">
+<td width="33%">
 
 #### 🛡️ Sentinel — Digest Agent
 Reads last 24h commits, scans for secrets & vulnerabilities, emails a polished HTML report, archives `reports/*.html`, and pings Slack / Discord / webhooks.
@@ -47,10 +47,18 @@ Reads last 24h commits, scans for secrets & vulnerabilities, emails a polished H
 `npm run digest`
 
 </td>
+<td width="33%">
+
+#### 🚑 The Healer — CI Fixer *(new)*
+Replays your red CI, diagnoses the root cause, patches surgically, verifies green, and pushes the fix — with throttle, 429 retry, and dry-run safety.
+
+`npm run healer -- --command "npm test"`
+
+</td>
 </tr>
 </table>
 
-> **✨ v0.3 — Webhooks, coverage & surgical patches** · Sentinel dispatches Slack Block Kit / Discord embeds / generic JSON in parallel (`Promise.allSettled`). Tester prioritizes uncovered lines via `get_coverage_summary` and edits with `patch_file` + cached `grep_search`. PRs support draft, labels & `Closes #issue`.
+> **✨ v0.4 — Healer + Webhooks, coverage & surgical patches** · **Healer** replays `npx tsc --noEmit` / `npm test` locally, fixes via `patch_file` loop (max 3 attempts), and pushes when `allowPush` is set. Sentinel dispatches Slack Block Kit / Discord embeds / generic JSON in parallel (`Promise.allSettled`). Tester prioritizes uncovered lines via `get_coverage_summary` and edits with `patch_file` + cached `grep_search`. PRs support draft, labels & `Closes #issue`.
 
 ---
 
@@ -59,7 +67,7 @@ Reads last 24h commits, scans for secrets & vulnerabilities, emails a polished H
 - [Overview](#-overview)
 - [Features](#-features)
 - [Quick Start — 3 Minutes](#-quick-start--3-minutes)
-- [How It Works — The Two Agents](#-how-it-works--the-two-agents)
+- [How It Works — The Three Agents](#-how-it-works--the-three-agents)
 - [Configuration](#-configuration)
 - [Usage Cookbook](#-usage-cookbook)
 - [Architecture](#-architecture)
@@ -75,7 +83,7 @@ Reads last 24h commits, scans for secrets & vulnerabilities, emails a polished H
 
 ## 🔭 Overview
 
-PRism is **two junior developers who never sleep** — living inside your repository.
+PRism is **three junior developers who never sleep** — living inside your repository.
 
 ```mermaid
 flowchart LR
@@ -85,6 +93,7 @@ flowchart LR
 
     Repo --> Tester[🧪 Tester\nCoverage Agent]
     Repo --> Sentinel[🛡️ Sentinel\nDigest Agent]
+    Repo --> Healer[🚑 Healer\nCI Fixer]
 
     Tester --> A1[explore\ngrep / coverage]
     A1 --> A2[write tests\npatch surgically]
@@ -100,8 +109,14 @@ flowchart LR
     B5 --> Discord[Discord]
     B5 --> Generic[Generic JSON]
 
+    Healer --> C1[checkout PR branch]
+    C1 --> C2[repro failing cmd\nnpm test / tsc]
+    C2 --> C3[diagnose + patch\nread → grep → patch]
+    C3 --> C4[verify green\n+ push fix]
+
     style Tester fill:#0f172a,stroke:#38bdf8,color:#f8fafc
     style Sentinel fill:#1e1b4b,stroke:#a5b4fc,color:#f8fafc
+    style Healer fill:#022c22,stroke:#10b981,color:#f8fafc
 ```
 
 **You’ll love PRism if you:**
@@ -110,6 +125,7 @@ flowchart LR
 - Want to know *what* changed, *who* did it, and *if it’s safe* — without reading 50 commits
 - Care about leaked `AKIA…`, `ghp_…`, or `postgres://user:pass@` slipping into git
 - Live in Slack / Discord and want the verdict there, not just email
+- Are tired of babysitting red CI — **Healer** replays the failing command locally, fixes it, and pushes the patch
 
 ---
 
@@ -120,6 +136,7 @@ flowchart LR
 | 🧪 | **Coverage-Aware Testing** | Parses `coverage-summary.json` & `lcov.info`, sorts by lowest coverage, exposes exact uncovered lines. Tests only what matters. |
 | 🔍 | **Surgical Code Intelligence** | `grep_search` (cached, single-regex) + `patch_file` (exact-match replace) — no full-file rewrites. |
 | 🛡️ | **Secret & Vuln Scanning** | 9-pattern combined regex in `O(L)` + `npm audit` (memoized 60s). Secrets truncated at 100 chars — never logged fully. |
+| 🚑 | **CI Auto-Healing** | Replays `npx tsc --noEmit` / `npm test` on the PR branch, patches via `patch_file` loop (max 3–5 attempts), verifies green, pushes fix. |
 | 📧 | **Beautiful HTML Reports** | Dark-mode, accessible, responsive email — also archived to `reports/digest-*.html` + `.md`. Always saved, even when email fails. |
 | 🔗 | **Parallel Webhooks** | Slack Block Kit, Discord embeds, and generic JSON fired via `Promise.allSettled` — one failure never blocks the others. |
 | ⏰ | **Zero-Config Scheduler** | `node-cron` daemon at `0 22 * * *` `Asia/Kolkata`. `--run-now` for instant test. Survives per-tick failures. |
@@ -199,6 +216,10 @@ npm run dev -- --focus "src/lib/utils"
 # Talk to it interactively
 npm run interactive
 
+# Fix a red CI branch locally (dry-run by default)
+npm run healer -- --command "npx tsc --noEmit"
+npm run healer -- --pr 42 --branch feat/add-checkout --command "npm test" --log /tmp/ci.log --allow-push
+
 # Leave it running → automatic 10pm IST email
 npm run schedule              # add --run-now to test immediately
 ```
@@ -207,7 +228,29 @@ That’s it. Next step is reading the email. ☕
 
 ---
 
-## 🧩 How It Works — The Two Agents
+## 🧩 How It Works — The Three Agents
+
+### 🚑 Healer — CI Auto-Fix *(new in v0.4)*
+
+7 steps, on demand or via `HEALER_ENABLED` hook:
+
+| Step | What happens | Tool |
+|------|--------------|------|
+| 1 | Checkout PR branch (`git fetch` + `checkout -B`) — falls back to current branch | `run_command` |
+| 2 | Reproduce failure: `run_command({ command: failingCommand })` | `run_command` |
+| 3 | If green → `healed:true, 0 attempts` (no-op). If red → build Gemini prompt with `ciLogTail` (8k) + `stderr` | LLM |
+| 4 | Iterative fix loop: `read_file` / `grep_search` → `patch_file` / `write_file` → `run_command` verify | `executeAgentTool` |
+| 5 | 13s throttle between Gemini calls + 429 retry (`retryDelay + 2s`, 2 attempts) | loop |
+| 6 | On green → commit via `.git/healer_commit_msg.txt` (`git add -A` → `commit -F` → `push origin <branch>`) | `commitAndPush` |
+| 7 | If `prNumber` + `GITHUB_TOKEN` → `POST /repos/:owner/:repo/issues/:pr/comments` | `fetch` |
+
+**Telemetry:** every `heal()` returns `{ healed, summary, attempts, metrics, fixCommitSha }` with `totalTurns`, `totalToolCalls`, `toolCallCounts`, `totalDurationMs`.
+
+> [!IMPORTANT]
+> **Dry-run by default.** The Healer only pushes when `allowPush:true` (CLI `--allow-push`) or `HEALER_ALLOW_PUSH=true`. Otherwise it patches, verifies green, and logs `Dry-run — not pushing`.
+
+> [!TIP]
+> Default `failingCommand` is `npx tsc --noEmit` (fastest smoke check). Pass `--command "npm test"` or `--command "npx eslint . --max-warnings 0"` for other failures.
 
 ### 🛡️ Sentinel — Daily Digest & Security Audit
 
@@ -267,11 +310,12 @@ All knobs live in `src/config.ts` but you never edit it — just set env vars. V
 | Must set (to get value) | Can tweak (sensible defaults) |
 |---|---|
 | `GEMINI_API_KEY` **or** Vertex (`GOOGLE_GENAI_USE_VERTEXAI` + `GOOGLE_CLOUD_PROJECT`) | `GEMINI_MODEL=gemini-2.5-flash` |
-| `GITHUB_TOKEN` (for PRs / private clones) | `TARGET_REPO_BRANCH=main` |
+| `GITHUB_TOKEN` (for PRs / private clones / Healer push) | `TARGET_REPO_BRANCH=main` |
 | `TARGET_REPO_URL` (defaults to demo repo) | `WORKSPACE_DIR=./workspace/fluent` |
 | `ALERT_EMAIL_TO` (defaults to `divyanshukumar.dev@proton.me`) | `MAX_AGENT_TURNS=25` |
 | Email: `SMTP_HOST`+`SMTP_USER` **or** `RESEND_API_KEY` (archive-only is fine) | `DIGEST_CRON_SCHEDULE="0 22 * * *"` / `DIGEST_TIMEZONE="Asia/Kolkata"` |
 | Webhooks: `SLACK_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` / `WEBHOOK_URL` | `GOOGLE_CLOUD_LOCATION=us-central1` |
+| Healer: `HEALER_ALLOW_PUSH=true` to actually push (default dry-run) | `HEALER_ENABLED=false` / `HEALER_MAX_ATTEMPTS=3` / `HEALER_WEBHOOK_PORT=8787` |
 
 ### Full Reference
 
@@ -299,6 +343,10 @@ All knobs live in `src/config.ts` but you never edit it — just set env vars. V
 | `WEBHOOK_URL` | — | — | Generic JSON webhook | Any `https://…` (alias `GENERIC_WEBHOOK_URL`) |
 | `DIGEST_CRON_SCHEDULE` | — | `0 22 * * *` | `node-cron` expr | 5-field cron (no seconds) |
 | `DIGEST_TIMEZONE` | — | `Asia/Kolkata` | IANA tz | `Asia/Kolkata`, `UTC`, `America/New_York` … |
+| `HEALER_ENABLED` | — | `false` | Master switch for webhook/daemon healer | `true`/`false` (strict `=== 'true'`) |
+| `HEALER_MAX_ATTEMPTS` | — | `3` | Max LLM attempts per `heal()` (capped 5) | `1`–`5` |
+| `HEALER_ALLOW_PUSH` | — | `false` | Allow `git push origin <branch>` on green | `true`/`false` — also `--allow-push` flag |
+| `HEALER_WEBHOOK_PORT` | — | `8787` | Port for future webhook listener | `1`–`65535` |
 
 ### Auth Priority — `createGenAIClient()`
 
@@ -326,6 +374,15 @@ npm run digest -- --since 7d                   # last 7 days
 npm run digest -- --since 30d                  # last 30 days
 npm run digest -- --since 7d --to lead@co.com  # custom recipient
 npm run digest -- --since 7d --model gemini-1.5-pro # bigger model
+
+# ── Healer (CI Fixer) — dry-run by default ─────────────────────
+npm run healer                                 # tsc on current branch, no push
+npm run healer -- --command "npx tsc --noEmit" # explicit typecheck
+npm run healer -- --command "npm test" --log /tmp/ci.log  # with CI log tail
+npm run healer -- --pr 42 --branch feat/foo --command "npm test" # checkout PR branch
+npm run healer -- --pr 42 --branch feat/foo --command "npm test" --allow-push # + push fix
+HEALER_ALLOW_PUSH=true npm run healer -- --command "npm test"     # env toggle
+npm run healer:branch -- --command "npm test"  # alias that requires --branch
 
 # ── Scheduler ──────────────────────────────────────────────
 npm run schedule                               # daemon → 22:00 daily
@@ -358,6 +415,19 @@ npm run test:coverage                          # vitest run --coverage
 | `--to <email>` | — | `--to lead@co.com` |
 | `--model <id>` | — | `--model gemini-1.5-pro` |
 
+**Healer CLI flags** (`healer_cli.ts`):
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--command <cmd>` | `string` | `npx tsc --noEmit` | Failing command to reproduce & heal |
+| `--branch <name>` | `string` | `config.targetBranch` | PR branch to checkout (`git fetch` + `checkout -B`) |
+| `--pr <number>` | `number` | — | PR number for commit message `fix(ci): … (#42)` + `POST /issues/:n/comments` |
+| `--log <path>` | `string` | — | Path to CI log file; last 8k chars sent to LLM |
+| `--allow-push` | flag | `false` (or `HEALER_ALLOW_PUSH`) | Push fix commit to `origin/<branch>` — needs `GITHUB_TOKEN` |
+| `--help` / `-h` | flag | — | Print help and exit |
+
+Exit codes: `0` = healed or already green, `1` = not healed or fatal error.
+
 **Coverage CLI flags** (`index.ts`):
 
 | Flag | Behavior |
@@ -382,6 +452,7 @@ flowchart TB
     subgraph Agents
       Coverage[CoverageAgent\nagent.ts]
       Sentinel[DailyCommitDigestAgent\ndigest_agent.ts]
+      Healer[HealerAgent\nhealer_agent.ts]
     end
 
     subgraph Tools
@@ -400,6 +471,7 @@ flowchart TB
     Config --> Agents
     Coverage --> Tools
     Sentinel --> Tools
+    Healer --> Tools
     Tools --> Mailer
     Tools --> Repo
 
@@ -413,8 +485,8 @@ flowchart TB
 
 ```
 PRism/
-├── .env.example              # copy to .env — all tunables
-├── package.json              # scripts: digest / schedule / coverage-job / interactive
+├── .env.example              # copy to .env — all tunables (incl. HEALER_* below)
+├── package.json              # scripts: digest / schedule / coverage-job / interactive / healer
 ├── tsconfig.json             # ES2022 + NodeNext, strict
 ├── reports/                  # auto-created — digest-*.html + .md
 ├── workspace/fluent/         # ephemeral clone (reset --hard every run)
@@ -422,12 +494,14 @@ PRism/
     ├── config.ts             # typed config (Zod) + createGenAIClient + parseGitHubRepoUrl
     ├── agent.ts              # CoverageAgent loop (explore → grep/coverage → patch/test → verify → PR)
     ├── digest_agent.ts       # Sentinel loop (commits → diff → audit → email + webhooks)
+    ├── healer_agent.ts       # Healer loop (checkout → repro → patch loop → verify → push + PR comment)
+    ├── healer_cli.ts         # npm run healer flag parsing (--pr/--branch/--command/--log/--allow-push)
     ├── digest_cli.ts         # npm run digest flag parsing + one-shot runner
     ├── scheduler.ts          # npm run schedule cron daemon + --run-now
     ├── index.ts              # npm run coverage-job / --focus / --interactive
     ├── services/mailer.ts    # HTML email (inline CSS) + Markdown + Resend/SMTP/Ethereal + webhooks
     └── tools/
-        ├── index.ts          # two Gemini toolsets + dispatchers
+        ├── index.ts          # three Gemini toolsets + dispatchers (agent/digest/healer share tools)
         ├── repo.ts           # GitRepoManager (clone / reset / push, PAT-injected)
         ├── file_ops.ts       # read_file / write_file / patch_file / list_dir / grep_search
         ├── command_runner.ts # run_command (exec in workspace, 8k trunc, hardened + 3s git cache)
@@ -465,6 +539,21 @@ PRism/
 | `get_commit_diff` | `commitHash?` / `fromHash+toHash` / `maxLines=500` | `git show` or `git diff from..to`; truncates at `maxLines` |
 | `run_security_audit` | `includeNpmAudit=true`, `commitRange?` (default `HEAD~5 HEAD`) | Single `COMBINED_SECRET_REGEX` O(L) + `SECRET_PATTERN_MAP` O(1) + 60s auditCache |
 | `send_digest_email` | `reportDate`, `timeWindow`, `securityVerdict`, `categorizedChanges`, `vulnerabilities`, `authors` … | Delegates to `MailerService`: single-pass escape O(n) + memoized HTML → archive → Resend→SMTP→Ethereal → parallel webhooks |
+
+</details>
+
+<details>
+<summary><strong>Healer tools</strong> (CI Fixer) — same sandbox, verification loop</summary>
+
+| Tool | Key params | What it does |
+|------|-----------|--------------|
+| `read_file` / `grep_search` | same as Tester | Explore failing file(s) — sandboxed via `resolveWorkspacePath` |
+| `patch_file` / `write_file` | same as Tester | Surgical fix; `patch_file` rejects ambiguous `targetContent` without `allowMultiple:true` |
+| `run_command` | `command=failingCommand`, `timeoutMs=60000` | Repro + verify loop; 8k trunc, `CI=true`, secrets stripped, 3s git cache |
+| *(internal)* `commitAndPush` | `branch`, `commitMsg` (via `.git/healer_commit_msg.txt`) | `git add -A` → `commit -F` → `push origin <branch>` — only when `allowPush:true` |
+| *(internal)* `commentOnPr` | `prNumber`, `sha`, `failingCommand` | `POST /repos/:owner/:repo/issues/:pr/comments` — best-effort, never fails the heal |
+
+Healer reuses `agentToolDeclarations` (no new declarations) so `executeAgentTool` is the dispatcher. The LLM is instructed to call `run_command` with the exact `failingCommand` after each patch until it exits `0`.
 
 </details>
 
@@ -522,6 +611,7 @@ echo 'SLACK_WEBHOOK_URL=https://hooks.slack.com/...' >> .env
 - **Ephemeral workspace** — every `initWorkspace()` does `reset --hard origin/<branch>`. Manual edits in `workspace/` are intentionally wiped.
 - **Shallow clone (`--depth 50`)** — `get_recent_commits --since 30d` on a busy repo may return fewer than expected. Increase depth in `src/tools/repo.ts` if long windows matter.
 - **Empty commit window** — not an error: falls back to latest **10 commits** and rewrites `timeWindow` to `Latest N commits (No commits in '…')`.
+- **Healer branch checkout** — `git fetch origin <branch> && git checkout -B <branch> origin/<branch> || git checkout <branch>`. If `branch` diverged, Healer force-syncs to `origin/<branch>`. Failure is warned (`Checkout warning: …`) and Healer continues on current branch rather than throwing.
 - **Token never logged** — only plain `repoUrl` is printed; PAT lives only in method locals (`getAuthenticatedUrl()` memoized).
 
 </details>
@@ -529,13 +619,14 @@ echo 'SLACK_WEBHOOK_URL=https://hooks.slack.com/...' >> .env
 <details>
 <summary><strong>File Tools & Commands</strong></summary>
 
-- **Path traversal blocked** — `resolveWorkspacePath` throws if `../../etc/passwd` would escape the workspace.
+- **Path traversal blocked** — `resolveWorkspacePath` throws if `../../etc/passwd` would escape the workspace. Uses `workspace + path.sep` check so `workspace-evil` sibling bypass fails.
 - **`list_dir` ignores** `.git`, `node_modules`, `.next`, `dist`, `.turbo`, `build`, `.cache` at every depth (Set O(1)).
 - **Output caps** — `list_dir` slices at 150, `run_command` truncates at **8 000 chars** (`…[Output truncated]`), `get_commit_diff` caps at `maxLines=500`, `grep_search` caps at `maxResults=50`. Narrow your query or check `count`.
 - **`run_command` buffer** — 10 MB `maxBuffer`; redirect huge logs: `npx vitest run > out.txt`.
 - **`run_command` hardened** — blocks `sudo`/`su`/`mkfs`/`dd if=`/`shutdown`/`rm -rf /`/fork bomb and host `.env` reads; strips `GITHUB_TOKEN`/`GEMINI_API_KEY`/`SMTP_PASS` from child env.
 - **`patch_file` exact match** — `targetContent` must match whitespace/indentation exactly. If it appears >1 time, rejected unless `allowMultiple:true`.
 - **`grep_search` cache** — 10s TTL, 40-entry LRU. Writes invalidate grep cache. `isRegex:false` escapes query so `a.b` doesn’t become regex.
+- **Healer `patch_file` tip** — copy exact block via `read_file` first; Healer often needs to patch `import` or type lines — include 2–3 surrounding lines to disambiguate.
 
 </details>
 
@@ -566,6 +657,7 @@ echo 'SLACK_WEBHOOK_URL=https://hooks.slack.com/...' >> .env
 - **Auth** — missing `GITHUB_TOKEN` → `{ success:false, message:"GITHUB_TOKEN is not configured…" }` (never throws).
 - **Force push** — `commitAndPush` uses `--force` — safe for agent `prism/*` branches but overwrites manual pushes to same branch.
 - **Branch default** — `prism/test-coverage-<Date.now()>` when `branchName` omitted; `commitMessage` defaults to `title`.
+- **Healer push** — unlike `create_pr`, Healer uses `git commit -F .git/healer_commit_msg.txt` (file-based to avoid shell quoting) then `git push origin <branch>` (no `--force -u`). `prNumber` comment is best-effort `POST /issues/:pr/comments`; failure is swallowed.
 
 </details>
 
@@ -589,6 +681,21 @@ echo 'SLACK_WEBHOOK_URL=https://hooks.slack.com/...' >> .env
 
 </details>
 
+<details>
+<summary><strong>Healer — CI Healing</strong></summary>
+
+- **Bounded attempts** — `maxAttempts = min(requested, HEALER_MAX_ATTEMPTS=3, cap 5)` + `HEALER_MAX_TURNS=10` hard stop. Prevents doom-loop on unfixable failures.
+- **Free-tier throttle** — same 13s gap as Tester/Sentinel between Gemini calls; 429 retry with `retryDelay + 2s` (2 attempts) baked into `heal()`.
+- **History reset** — each `heal()` clears `this.history = []` — no cross-PR leakage. Safe to call `heal()` 3× on different branches with the same instance.
+- **Dry-run safety** — default `allowPush:false` means Healer verifies green but never pushes. Set `HEALER_ALLOW_PUSH=true` or `--allow-push` explicitly to enable `git push`.
+- **Already green** — if `failingCommand` exits `0` locally, `heal()` returns instantly `{ healed:true, attempts:0, summary:"No fix needed …" }`.
+- **Log tail cap** — `ciLogTail` sliced to **8000 chars** before LLM to keep context small; pass via `--log <path>` file read (warns but continues if file missing).
+- **Commit hygiene** — message includes `fix(ci): Heal <cmd> for <branch> (#pr)` + `Co-authored-by: PRism Healer`. Uses `.git/healer_commit_msg.txt` to avoid shell quoting; falls back to `git commit -m "first line"` if `writeFileSync` fails.
+- **Push & comment** — push via `git push origin <branch>`; comment via `Bearer <GITHUB_TOKEN>` POST to `/issues/:pr/comments` — both best-effort, never throw to caller.
+- **Telemetry** — `HealerMetrics` captures `totalTurns`, `totalToolCalls`, `toolCallCounts` map, `totalDurationMs`, `healed` flag per `healId`.
+
+</details>
+
 ---
 
 ## ❓ Troubleshooting
@@ -609,6 +716,10 @@ echo 'SLACK_WEBHOOK_URL=https://hooks.slack.com/...' >> .env
 | `[Security Violation] Command blocked` | Hardened `run_command` rejected it | Avoid `sudo`/`rm -rf /`/`cat ../../.env` |
 | `No coverage report found` | `get_coverage_summary` no file | Run `npx vitest run --coverage` first |
 | `[Slack Webhook Error] 404` | Bad webhook URL | Verify URL from Slack/Discord settings; test with `curl -X POST` |
+| `✖ Not healed` after healer run (exit 1) | Healer exhausted `maxAttempts`/turns | Check logs for `Still red after attempt N`; increase `HEALER_MAX_ATTEMPTS=5` or narrow `--command` |
+| `Could not read log file /tmp/ci.log` | Bad `--log` path | Ensure file exists; Healer continues with `stderr`-only context anyway |
+| `Checkout warning: …` in healer | Branch not on remote yet | Push branch first or omit `--branch` to heal current workspace branch |
+| `Dry-run — not pushing` | `HEALER_ALLOW_PUSH=false` | Add `--allow-push` or set `HEALER_ALLOW_PUSH=true` in `.env` to push |
 
 ---
 
@@ -657,6 +768,9 @@ npm run schedule -- --run-now     # instant + nightly 22:00
 npm run coverage-job              # alias for coverage-agent full mission
 npm run dev -- --focus "src/lib"  # Tester, focused
 npm run interactive               # REPL chat
+npm run healer -- --help          # flags: --pr / --branch / --command / --log / --allow-push
+npm run healer -- --command "npx tsc --noEmit"   # heal typecheck (dry-run)
+npm run healer -- --command "npm test" --allow-push  # heal + push (needs GITHUB_TOKEN)
 npm run typecheck                 # tsc --noEmit (also surfaces TSDoc)
 npm run build                     # tsc → dist/
 npm start                         # node dist/index.js (after build)
@@ -675,13 +789,15 @@ Every module under `src/` carries comprehensive TSDoc headers **plus inline `// 
 | `src/config.ts` | Full `AppConfig` (Zod) docs, `parseGitHubRepoUrl` contract, `createGenAIClient` cascade | `// O(1) memoization for repo URL parsing` |
 | `src/agent.ts` | 5-step mission template, `RunMissionOptions`, `maxTurns` | `// bounded history` |
 | `src/digest_agent.ts` | 8-step Sentinel (now 9 with webhooks), `cachedCommits` lifecycle | `// cachedCommits thread-through` |
+| `src/healer_agent.ts` | 7-step Healer (checkout→repro→patch→verify→push), `HealContext`/`HealResult` + telemetry | `// 13s throttle` `// 429 retry` `// 8k logTail cap` |
+| `src/healer_cli.ts` | CLI flag parsing (`--pr/--branch/--command/--log/--allow-push`), help + exit codes | `--log` file read warn, dry-run guard |
 | `src/tools/repo.ts` | Auth-URL injection (O(1) memo), `setupWorkspace` vs shallow clone | `// O(1) memoization for auth URL` |
 | `src/tools/file_ops.ts` | Traversal guard, slice annotation, ignore-list, `patch_file`, `grep_search` | `// O(1) Set` `// TTL LRU` `// single compiled regex` |
 | `src/tools/command_runner.ts` | Timeout, 8k trunc, `CI=true`, hardening, secret strip | `// O(1) cache for git` `// SENSITIVE_ENV_KEYS strip` |
 | `src/tools/coverage.ts` | `coverage-summary.json`/`lcov.info` parsing, `formatLineRanges` | `// 15s memo by mtime` `// O(F*S) single-pass` |
 | `src/tools/git_digest.ts` | 4-tool matrix, 9-pattern secret catalog, custom `commitRange` | `// Promise.all O(n/p)` `// COMBINED_SECRET_REGEX O(L)` |
 | `src/tools/github_pr.ts` | Branch naming, PAT setup, PR footer, draft/labels | `// O(1) repo parse memo` `// buildPrBody` |
-| `src/tools/index.ts` | Two dispatchers, `cachedCommits` thread-through | dispatcher unchanged (9 declarations) |
+| `src/tools/index.ts` | Three dispatchers, `cachedCommits` thread-through | dispatcher unchanged (9+4 declarations) |
 | `src/services/mailer.ts` | HTML section order, Markdown sibling, provider cascade, webhooks | `// single-pass ESCAPE_MAP` `// htmlRenderCache` `// dispatchWebhooks allSettled` |
 | `src/index.ts` / `src/digest_cli.ts` | Flag parsing, `customPrompt` vs `focusArea`, `--since` normalization | unchanged |
 | `src/scheduler.ts` | Cron validation, `--run-now` ordering, daemon supervision | bounded cache notes |
@@ -710,5 +826,5 @@ MIT — see [`LICENSE`](./LICENSE).
 
 <p align="center">
   <sub>Generated autonomously by <a href="https://github.com/Divyanshu-kumar14/PRism">PRism</a> (<code>@google/genai</code>) and documented for human operators.</sub><br />
-  <sub>Two agents. One repo. Zero manual busywork. 🔮</sub>
+  <sub>Three agents. One repo. Zero manual busywork. 🔮</sub>
 </p>
