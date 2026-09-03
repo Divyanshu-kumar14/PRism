@@ -96,8 +96,8 @@ async function main() {
     console.log('\x1b[1m\x1b[32m✔ Daily Digest Completed & Dispatched\x1b[0m');
     console.log('\x1b[35m============================================================\x1b[0m');
     console.log(`\n${report}\n`);
-  } catch (err: any) {
-    console.error('\n\x1b[31m[Digest Error]:\x1b[0m', err.message || err);
+  } catch (err: unknown) {
+    console.error('\n\x1b[31m[Digest Error]:\x1b[0m', (err instanceof Error ? err.message : String(err)) || err);
     process.exit(1);
   }
 }

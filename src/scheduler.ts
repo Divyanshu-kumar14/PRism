@@ -77,8 +77,8 @@ async function triggerDailyDigestJob() {
       recipient: config.emailRecipient,
     });
     console.log(`\n\x1b[32m✔ Scheduled Daily Digest finished successfully.\x1b[0m`);
-  } catch (err: any) {
-    console.error(`\x1b[31m✖ Scheduled Daily Digest encountered an error:\x1b[0m`, err.message || err);
+  } catch (err: unknown) {
+    console.error(`\x1b[31m✖ Scheduled Daily Digest encountered an error:\x1b[0m`, (err instanceof Error ? err.message : String(err)) || err);
   }
 }
 

@@ -112,8 +112,8 @@ async function main() {
         try {
           const response = await agent.chat(trimmed);
           console.log(`\n\x1b[1m\x1b[32mPRism Agent >\x1b[0m\n${response}\n`);
-        } catch (error: any) {
-          console.error(`\x1b[31m[Error]:\x1b[0m ${error.message || error}\n`);
+        } catch (error: unknown) {
+          console.error(`\x1b[31m[Error]:\x1b[0m ${(error instanceof Error ? error.message : String(error)) || error}\n`);
         }
 
         promptUser();
@@ -142,8 +142,8 @@ async function main() {
     console.log('\x1b[1m\x1b[32m✔ Mission Completed Successfully\x1b[0m');
     console.log('\x1b[35m============================================================\x1b[0m');
     console.log(`\n${finalReport}\n`);
-  } catch (error: any) {
-    console.error('\n\x1b[31m[Mission Error]:\x1b[0m', error.message || error);
+  } catch (error: unknown) {
+    console.error('\n\x1b[31m[Mission Error]:\x1b[0m', (error instanceof Error ? error.message : String(error)) || error);
     process.exit(1);
   }
 }

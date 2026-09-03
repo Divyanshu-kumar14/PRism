@@ -6,6 +6,15 @@
  * - Maintains an ever‑growing `history: AgentMessage[]` so each `generateContent` call
  *   has full conversational context (user messages + tool results).
  * - Delegates every side‑effect to {@link executeAgentTool} (file ops, `run_command`, `create_pr`).
+ * - Provides structured telemetry/metrics for observability (turn timing, tool usage, errors).
+ *
+ * **Performance Optimizations:**
+ * - **Free-tier throttle**: 13s minimum interval between Gemini calls to stay under 5 RPM.
+ *   Prevents 429 RESOURCE_EXHAUSTED errors on free tier without billing.
+ * - **Retry with exponential backoff**: On 429, waits `retryDelay + 2s` up to 2 attempts.
+ * - **History management**: `resetHistory()` clears context between independent runs to
+ *   prevent context window overflow and reduce token costs.
+ * - **Structured logging**: Turn-level and tool-level timing for observability dashboards.
  *
  * **Key configurations / parameters**
  *
@@ -38,7 +47,7 @@
  * **Edge cases / gotchas**
  * - `chat()` accumulates state in `this.history`. Call `resetHistory()` when starting an
  *   unrelated task or when `history` grows large enough to approach the Gemini context limit.
- * - `history` is **append‑only** inside a single `chat()` invocation. The “no tool calls → return”
+ * - `history` is **append‑only** inside a single `chat()` invocation. The "no tool calls → return"
  *   rule is the only termination signal; if the LLM stalls on tool calls the loop will run
  *   exactly `config.maxTurns` (≈ cost) then return the `reached maximum turns` sentinel.
  * - `createGenAIClient()` may still be mis‑configured (no PAT, no API key, wrong region) —
@@ -54,10 +63,76 @@ import { GoogleGenAI } from '@google/genai';
 import { createGenAIClient, config } from './config.js';
 import { agentToolDeclarations, executeAgentTool, GitRepoManager } from './tools/index.js';
 
-/** Gemini‑style content block the SDK expects (thinly typed; SDK drift is tolerated as `any`). */
+// ── Telemetry Types ──────────────────────────────────────────────────────
+
+/** Per-turn metrics for observability. */
+export interface TurnMetrics {
+  turnNumber: number;
+  startTime: number;
+  endTime: number;
+  durationMs: number;
+  toolCalls: ToolCallMetric[];
+  hasTextResponse: boolean;
+  hasFunctionCalls: boolean;
+  error?: string;
+}
+
+/** Per-tool-call metrics for observability. */
+export interface ToolCallMetric {
+  toolName: string;
+  startTime: number;
+  endTime: number;
+  durationMs: number;
+  success: boolean;
+  error?: string;
+}
+
+/** Mission-level summary metrics. */
+export interface MissionMetrics {
+  missionId: string;
+  startTime: number;
+  endTime: number;
+  totalDurationMs: number;
+  totalTurns: number;
+  totalToolCalls: number;
+  toolCallCounts: Record<string, number>;
+  success: boolean;
+  finalError?: string;
+  focusArea?: string;
+  customPrompt?: boolean;
+}
+
+/** Simple mission ID generator for tracing. */
+function generateMissionId(): string {
+  return `mission_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+/** Formats duration in human-readable form. */
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60000)}m ${((ms % 60000) / 1000).toFixed(0)}s`;
+}
+
+// ── Free-tier throttling ─────────────────────────────────────────────────
+
+// Free-tier throttling: 5 RPM → 13s gap (see digest_agent.ts)
+const FREE_TIER_MIN_INTERVAL_MS_COV = 13_000;
+const sleepCov = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// ── AgentMessage & RunMissionOptions ─────────────────────────────────────
+
+export interface AgentPart {
+  text?: string;
+  functionCall?: { name: string; args?: Record<string, unknown> };
+  functionResponse?: { name: string; response: unknown };
+  thought?: boolean;
+}
+
+/** Gemini‑style content block the SDK expects (thinly typed; SDK drift guarded via AgentPart). */
 export interface AgentMessage {
   role: 'user' | 'model';
-  parts: any[];
+  parts: AgentPart[];
 }
 
 /**
@@ -90,16 +165,17 @@ export interface RunMissionOptions {
  * console.log(report);
  * ```
  */
-// Free-tier throttling: 5 RPM → 13s gap (see digest_agent.ts)
-const FREE_TIER_MIN_INTERVAL_MS_COV = 13_000;
-const sleepCov = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
 export class CoverageAgent {
   private client: GoogleGenAI;
   private model: string;
   private repoManager: GitRepoManager;
   private history: AgentMessage[] = [];
   private lastGeminiCallMs = 0;
+
+  // Telemetry state
+  private currentMissionMetrics: MissionMetrics | null = null;
+  private currentTurnMetrics: TurnMetrics | null = null;
+  private missionStartTime = 0;
 
   /**
    * @param customModel - Gemeni model id overriding `config.model` for this agent only.
@@ -122,6 +198,21 @@ export class CoverageAgent {
   }
 
   /**
+   * Returns the telemetry metrics for the last completed mission.
+   * Useful for observability dashboards and debugging.
+   */
+  public getLastMissionMetrics(): MissionMetrics | null {
+    return this.currentMissionMetrics;
+  }
+
+  /**
+   * Returns the telemetry metrics for the current/last turn.
+   */
+  public getLastTurnMetrics(): TurnMetrics | null {
+    return this.currentTurnMetrics;
+  }
+
+  /**
    * Ensures the workspace clone exists and is on `origin/<targetBranch>`.
    * Delegates to {@link GitRepoManager#setupWorkspace}.
    *
@@ -130,8 +221,10 @@ export class CoverageAgent {
    */
   public async initWorkspace(): Promise<void> {
     console.log('\n\x1b[36m⚙️  Preparing target repository workspace...\x1b[0m');
+    const startTime = Date.now();
     const result = await this.repoManager.setupWorkspace();
-    console.log(`\x1b[32m✔  ${result.message}\x1b[0m\n`);
+    const durationMs = Date.now() - startTime;
+    console.log(`\x1b[32m✔  ${result.message}\x1b[0m \x1b[90m(${durationMs}ms)\x1b[0m\n`);
   }
 
   /**
@@ -164,7 +257,49 @@ export class CoverageAgent {
 5. Once all tests are passing and coverage gains are verified, open a Pull Request using create_pr with a detailed breakdown of the tests added and coverage gained.`
     );
 
-    return await this.chat(missionPrompt, workspaceRoot);
+    // Initialize mission telemetry
+    const missionId = generateMissionId();
+    this.missionStartTime = Date.now();
+    this.currentMissionMetrics = {
+      missionId,
+      startTime: this.missionStartTime,
+      endTime: 0,
+      totalDurationMs: 0,
+      totalTurns: 0,
+      totalToolCalls: 0,
+      toolCallCounts: {},
+      success: false,
+      focusArea: options.focusArea,
+      customPrompt: !!options.customPrompt,
+    };
+
+    console.log(`\x1b[36m[Telemetry]\x1b[0m Mission started: ${missionId} ${options.focusArea ? `(focus: ${options.focusArea})` : ''}`);
+
+    try {
+      const result = await this.chat(missionPrompt, workspaceRoot);
+
+      // Finalize mission metrics
+      const missionEndTime = Date.now();
+      if (this.currentMissionMetrics) {
+        this.currentMissionMetrics.endTime = missionEndTime;
+        this.currentMissionMetrics.totalDurationMs = missionEndTime - this.missionStartTime;
+        this.currentMissionMetrics.success = true;
+        console.log(`\x1b[36m[Telemetry]\x1b[0m Mission completed: ${missionId} in ${formatDuration(this.currentMissionMetrics.totalDurationMs)} (${this.currentMissionMetrics.totalTurns} turns, ${this.currentMissionMetrics.totalToolCalls} tool calls)`);
+      }
+
+      return result;
+    } catch (error: unknown) {
+      // Finalize mission metrics on error
+      const missionEndTime = Date.now();
+      if (this.currentMissionMetrics) {
+        this.currentMissionMetrics.endTime = missionEndTime;
+        this.currentMissionMetrics.totalDurationMs = missionEndTime - this.missionStartTime;
+        this.currentMissionMetrics.success = false;
+        this.currentMissionMetrics.finalError = (error instanceof Error ? error.message : String(error));
+        console.error(`\x1b[31m[Telemetry]\x1b[0m Mission failed: ${missionId} after ${formatDuration(this.currentMissionMetrics.totalDurationMs)} — ${error instanceof Error ? error.message : String(error)}`);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -187,7 +322,7 @@ export class CoverageAgent {
    * **Gotchas**
    * - `systemInstruction` enforces test quality (no fake `assert(true)`) and the `run_command` → `create_pr`
    *   verification contract. Tweaking it is the primary lever for agent quality.
-   * - Tool errors are fed back as `{ error: err.message }` function responses so the LLM can self‑fix.
+   * - Tool errors are fed back as `{ error: (err instanceof Error ? err.message : String(err)) }` function responses so the LLM can self‑fix.
    */
   public async chat(userMessage: string, workspaceRootOverride?: string): Promise<string> {
     const workspaceRoot = workspaceRootOverride || this.repoManager.getWorkspacePath();
@@ -230,6 +365,19 @@ Guidelines:
 
     while (turns < maxTurns) {
       turns++;
+      const turnStartTime = Date.now();
+
+      // Initialize turn telemetry
+      this.currentTurnMetrics = {
+        turnNumber: turns,
+        startTime: turnStartTime,
+        endTime: 0,
+        durationMs: 0,
+        toolCalls: [],
+        hasTextResponse: false,
+        hasFunctionCalls: false,
+      };
+
       console.log(`\n\x1b[90m[Turn ${turns}/${maxTurns}] Agent thinking...\x1b[0m`);
 
       // Free-tier throttle: keep <5 RPM to avoid 429 on free tier (see digest_agent)
@@ -240,31 +388,39 @@ Guidelines:
         await sleepCov(waitMs);
       }
 
-      let response: any;
+      let response: { candidates?: Array<{ content?: { parts?: AgentPart[] } }>; text?: string } | undefined;
       let attempt = 0;
       while (true) {
         try {
           this.lastGeminiCallMs = Date.now();
-          response = await this.client.models.generateContent({
+          response = (await this.client.models.generateContent({
             model: this.model,
-            contents: this.history,
+            // Cast to accommodate SDK Content type while keeping our typed AgentMessage
+            contents: this.history as unknown as never,
             config: {
               systemInstruction,
               tools,
             },
-          });
+          })) as unknown as { candidates?: Array<{ content?: { parts?: AgentPart[] } }>; text?: string };
           break;
-        } catch (err: any) {
-          const msg = err?.message || '';
-          const is429 = err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          const errStatus = (err as { status?: number })?.status;
+          const msg = errorMessage || '';
+          const is429 = errStatus === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota exceeded');
           const retryMatch = msg.match(/retryDelay.*?(\d+)s/i) || msg.match(/Please retry in (\d+)/i);
           const retrySec = retryMatch ? parseInt(retryMatch[1], 10) : 50;
           if (is429 && attempt < 2) {
             attempt++;
-            const waitMs = (retrySec + 2) * 1000;
+            const RETRY_BUFFER_SECONDS = 2;
+            const waitMs = (retrySec + RETRY_BUFFER_SECONDS) * 1000;
             console.warn(`\x1b[33m⚠️  Gemini 429 — waiting ${retrySec}s (attempt ${attempt}/2)...\x1b[0m`);
             await sleepCov(waitMs);
             continue;
+          }
+          // Record error in turn metrics
+          if (this.currentTurnMetrics) {
+            this.currentTurnMetrics.error = msg;
           }
           throw err;
         }
@@ -279,21 +435,36 @@ Guidelines:
       this.history.push(modelContent as AgentMessage);
 
       // Print any model reasoning/text thought
-      const textParts = candidate.content.parts?.filter((p: any) => p.text);
+      const textParts = candidate.content.parts?.filter((p: AgentPart) => p.text);
       if (textParts && textParts.length > 0) {
         for (const p of textParts) {
           if (p.text && typeof p.text === 'string' && p.text.trim()) {
             console.log(`\x1b[37m${p.text}\x1b[0m`);
           }
         }
+        if (this.currentTurnMetrics) {
+          this.currentTurnMetrics.hasTextResponse = true;
+        }
       }
 
       // 3. Check for function calls
-      const functionCalls = candidate.content.parts?.filter((p: any) => p.functionCall);
+      const functionCalls = candidate.content.parts?.filter((p: AgentPart) => p.functionCall);
 
       if (!functionCalls || functionCalls.length === 0) {
         // No function calls: agent completed its response
+        const turnEndTime = Date.now();
+        if (this.currentTurnMetrics) {
+          this.currentTurnMetrics.endTime = turnEndTime;
+          this.currentTurnMetrics.durationMs = turnEndTime - turnStartTime;
+        }
+        if (this.currentMissionMetrics) {
+          this.currentMissionMetrics.totalTurns = turns;
+        }
         return response.text || '(Mission concluded)';
+      }
+
+      if (this.currentTurnMetrics) {
+        this.currentTurnMetrics.hasFunctionCalls = true;
       }
 
       // 4. Execute all requested tool calls
@@ -302,20 +473,45 @@ Guidelines:
       for (const part of functionCalls) {
         const call = part.functionCall!;
         const toolName = call.name || 'unknown_tool';
+        const toolStartTime = Date.now();
+
         console.log(`\x1b[36m⚙️ [Tool Call]\x1b[0m \x1b[1m${toolName}\x1b[0m(${JSON.stringify(call.args)})`);
 
+        let toolResult: unknown;
+        let toolError: string | undefined;
+
         try {
-          const toolResult = await executeAgentTool(
+          toolResult = await executeAgentTool(
             toolName,
-            call.args,
+            call.args as unknown,
             workspaceRoot,
             this.repoManager
           );
 
+          const toolEndTime = Date.now();
+          const toolDurationMs = toolEndTime - toolStartTime;
+
+          // Record tool call metrics
+          const toolMetric: ToolCallMetric = {
+            toolName,
+            startTime: toolStartTime,
+            endTime: toolEndTime,
+            durationMs: toolDurationMs,
+            success: true,
+          };
+
+          if (this.currentTurnMetrics) {
+            this.currentTurnMetrics.toolCalls.push(toolMetric);
+          }
+          if (this.currentMissionMetrics) {
+            this.currentMissionMetrics.totalToolCalls++;
+            this.currentMissionMetrics.toolCallCounts[toolName] = (this.currentMissionMetrics.toolCallCounts[toolName] || 0) + 1;
+          }
+
           // Log brief summary of tool output
           const summaryStr = JSON.stringify(toolResult);
           const truncatedSummary = summaryStr.length > 250 ? summaryStr.slice(0, 250) + '...' : summaryStr;
-          console.log(`\x1b[32m✔ [Tool Result]\x1b[0m ${truncatedSummary}`);
+          console.log(`\x1b[32m✔ [Tool Result]\x1b[0m ${truncatedSummary} \x1b[90m(${toolDurationMs}ms)\x1b[0m`);
 
           functionResponseParts.push({
             functionResponse: {
@@ -323,12 +519,34 @@ Guidelines:
               response: toolResult,
             },
           });
-        } catch (err: any) {
-          console.error(`\x1b[31m✖ [Tool Error]\x1b[0m ${err.message}`);
+        } catch (err: unknown) {
+          const toolEndTime = Date.now();
+          const toolDurationMs = toolEndTime - toolStartTime;
+          toolError = (err instanceof Error ? err.message : String(err));
+
+          // Record failed tool call metrics
+          const toolMetric: ToolCallMetric = {
+            toolName,
+            startTime: toolStartTime,
+            endTime: toolEndTime,
+            durationMs: toolDurationMs,
+            success: false,
+            error: toolError,
+          };
+
+          if (this.currentTurnMetrics) {
+            this.currentTurnMetrics.toolCalls.push(toolMetric);
+          }
+          if (this.currentMissionMetrics) {
+            this.currentMissionMetrics.totalToolCalls++;
+            this.currentMissionMetrics.toolCallCounts[toolName] = (this.currentMissionMetrics.toolCallCounts[toolName] || 0) + 1;
+          }
+
+          console.error(`\x1b[31m✖ [Tool Error]\x1b[0m ${toolError} \x1b[90m(${toolDurationMs}ms)\x1b[0m`);
           functionResponseParts.push({
             functionResponse: {
               name: toolName,
-              response: { error: err.message },
+              response: { error: toolError },
             },
           });
         }
@@ -339,6 +557,20 @@ Guidelines:
         role: 'user',
         parts: functionResponseParts,
       });
+
+      // Finalize turn metrics
+      const turnEndTime = Date.now();
+      if (this.currentTurnMetrics) {
+        this.currentTurnMetrics.endTime = turnEndTime;
+        this.currentTurnMetrics.durationMs = turnEndTime - turnStartTime;
+      }
+    }
+
+    // Max turns reached
+    if (this.currentMissionMetrics) {
+      this.currentMissionMetrics.totalTurns = turns;
+      this.currentMissionMetrics.success = false;
+      this.currentMissionMetrics.finalError = `Reached maximum turns limit (${maxTurns})`;
     }
 
     return `Agent reached maximum turns limit (${maxTurns}) without final completion.`;

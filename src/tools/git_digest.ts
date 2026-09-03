@@ -74,8 +74,19 @@ const execAsync = promisify(exec);
 // ── Performance: shared caches & O(1) lookup structures ───────────────
 // Audit cache: memoize npm audit + secret scan for 60s (agent may call audit twice in one mission)
 // O(1) Map lookup avoids O(n) child_process spawn for redundant scans
-const auditCache = new Map<string, { ts: number; result: { npmAudit?: any; secretScanResults: Array<{ file: string; matchType: string; snippet: string }>; status: string } }>();
+export interface NpmAuditResult {
+  vulnerabilitiesCount?: Record<string, number>;
+  totalDependencies?: number;
+  note?: string;
+  raw?: unknown;
+}
+
+const auditCache = new Map<string, { ts: number; result: { npmAudit?: NpmAuditResult | null; secretScanResults: Array<{ file: string; matchType: string; snippet: string }>; status: string } }>();
 const AUDIT_TTL_MS = 60_000;
+const AUDIT_CACHE_MAX_SIZE = 50;
+const GIT_DIFF_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+const DEFAULT_MAX_DIFF_LINES = 500;
+const SECRET_SNIPPET_MAX_CHARS = 100;
 
 // O(1) Map for secret pattern lookup — allows single-pass regex test then O(1) type resolution
 // WHY: Previously O(L*P) nested loops (L = added lines ~5000, P = 9 patterns => 45k regex tests).
@@ -507,8 +518,9 @@ export async function executeGetRecentCommits(
       timeWindow: isFallback ? `Latest ${commits.length} commits (No commits in '${since}')` : since,
       allFiles: Array.from(allFilesSet),
     };
-  } catch (err: any) {
-    throw new Error(`Failed to get recent commits: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to get recent commits: ${errorMessage}`);
   }
 }
 
@@ -532,7 +544,7 @@ export async function executeGetCommitDiff(
   workspaceRoot: string,
   params: GetCommitDiffParams
 ): Promise<{ diff: string; truncated: boolean; lines: number }> {
-  const maxLines = params.maxLines || 500;
+  const maxLines = params.maxLines || DEFAULT_MAX_DIFF_LINES;
   let cmd = '';
 
   if (params.fromHash && params.toHash) {
@@ -544,7 +556,7 @@ export async function executeGetCommitDiff(
   }
 
   try {
-    const { stdout } = await execAsync(cmd, { cwd: workspaceRoot, maxBuffer: 10 * 1024 * 1024 });
+    const { stdout } = await execAsync(cmd, { cwd: workspaceRoot, maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES });
     const lines = stdout.split('\n');
     const truncated = lines.length > maxLines;
     const cleanDiff = truncated ? lines.slice(0, maxLines).join('\n') + `\n\n... [Diff truncated at ${maxLines} lines for brevity]` : stdout;
@@ -554,8 +566,9 @@ export async function executeGetCommitDiff(
       truncated,
       lines: lines.length,
     };
-  } catch (err: any) {
-    throw new Error(`Failed to retrieve commit diff: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to retrieve commit diff: ${errorMessage}`);
   }
 }
 
@@ -590,7 +603,7 @@ export async function executeRunSecurityAudit(
   workspaceRoot: string,
   params: RunSecurityAuditParams
 ): Promise<{
-  npmAudit?: any;
+  npmAudit?: NpmAuditResult | null;
   secretScanResults: Array<{ file: string; matchType: string; snippet: string }>;
   status: string;
 }> {
@@ -645,7 +658,7 @@ export async function executeRunSecurityAudit(
           secretScanResults.push({
             file: currentFile,
             matchType: matchedType, // O(1) Map-resolved type
-            snippet: line.trim().slice(0, 100),
+            snippet: line.trim().slice(0, SECRET_SNIPPET_MAX_CHARS),
           });
         }
       }
@@ -655,7 +668,7 @@ export async function executeRunSecurityAudit(
   }
 
   // 2. Run npm audit if package.json exists
-  let npmAudit: any = null;
+  let npmAudit: NpmAuditResult | null = null;
   const packageJsonPath = path.join(workspaceRoot, 'package.json');
   if (params.includeNpmAudit !== false && fs.existsSync(packageJsonPath)) {
     try {
@@ -682,7 +695,7 @@ export async function executeRunSecurityAudit(
   // Memoize for 60s — O(1) Map set, next identical audit call returns instantly
   auditCache.set(auditKey, { ts: Date.now(), result });
   // Bounded cache — evict oldest if >50 entries (prevents leak in long-lived scheduler)
-  if (auditCache.size > 50) {
+  if (auditCache.size > AUDIT_CACHE_MAX_SIZE) {
     const first = auditCache.keys().next().value as string;
     auditCache.delete(first);
   }

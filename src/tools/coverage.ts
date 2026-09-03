@@ -38,7 +38,8 @@ import { resolveWorkspacePath } from './file_ops.js';
 // memory leak in long-lived scheduler (max 20 entries = ~10KB keys).
 const COVERAGE_CACHE_TTL_MS = 15_000;
 const COVERAGE_CACHE_MAX = 20;
-const coverageCache = new Map<string, { ts: number; mtimeMs: number; result: any }>();
+const COVERAGE_PERCENT_PRECISION = 10000;
+const STREAMING_THRESHOLD_BYTES = 1_048_576;
 
 function buildCoverageCacheKey(workspaceRoot: string, foundPath: string, params: GetCoverageSummaryParams): string {
   // O(1) hashed key: workspace + relative report path + filter params → stable cache hit
@@ -86,6 +87,30 @@ export interface GetCoverageSummaryParams {
   /** Maximum number of lowest-covered files to return. Defaults to 20. */
   maxFiles?: number;
 }
+
+interface CoverageSuccessResult {
+  success: true;
+  total: {
+    linesPct: number;
+    statementsPct: number;
+    functionsPct: number;
+    branchesPct: number;
+  };
+  totalFilesAnalyzed: number;
+  files: FileCoverageDetail[];
+  message: string;
+}
+
+interface CoverageReportFileEntry {
+  lines?: { total?: number; covered?: number; pct?: number };
+  statements?: { pct?: number };
+  functions?: { pct?: number };
+  branches?: { pct?: number };
+  statementMap?: Record<string, { start?: { line: number } }>;
+  s?: Record<string, number>;
+}
+
+const coverageCache = new Map<string, { ts: number; mtimeMs: number; result: CoverageSuccessResult | { success: false; error: string } }>();
 
 export const getCoverageSummaryFunctionDeclaration: FunctionDeclaration = {
   name: 'get_coverage_summary',
@@ -189,7 +214,7 @@ function parseLcovContent(content: string, workspaceRoot: string): FileCoverageD
     }
 
     if (currentFile && totalLines > 0) {
-      const pct = Math.round((coveredLines / totalLines) * 10000) / 100;
+      const pct = Math.round((coveredLines / totalLines) * COVERAGE_PERCENT_PRECISION) / 100;
       files.push({
         file: currentFile,
         linesPct: pct,
@@ -232,7 +257,7 @@ async function parseLcovStreaming(filePath: string, workspaceRoot: string): Prom
       if (line.startsWith('SF:')) {
         // Emit previous file if exists
         if (currentFile && totalLines > 0) {
-          const pct = Math.round((coveredLines / totalLines) * 10000) / 100;
+          const pct = Math.round((coveredLines / totalLines) * COVERAGE_PERCENT_PRECISION) / 100;
           files.push({
             file: currentFile,
             linesPct: pct,
@@ -269,7 +294,7 @@ async function parseLcovStreaming(filePath: string, workspaceRoot: string): Prom
     rl.on('close', () => {
       // Emit last file
       if (currentFile && totalLines > 0) {
-        const pct = Math.round((coveredLines / totalLines) * 10000) / 100;
+        const pct = Math.round((coveredLines / totalLines) * COVERAGE_PERCENT_PRECISION) / 100;
         files.push({
           file: currentFile,
           linesPct: pct,
@@ -368,7 +393,7 @@ export async function executeGetCoverageSummary(
 
     // Determine if we should use streaming (large LCOV files)
     const stat = fs.statSync(foundPath);
-    const USE_STREAMING = foundPath.endsWith('.info') && stat.size > 1_048_576; // 1MB threshold
+    const USE_STREAMING = foundPath.endsWith('.info') && stat.size > STREAMING_THRESHOLD_BYTES;
 
     if (foundPath.endsWith('.json')) {
       const raw = fs.readFileSync(foundPath, 'utf8');
@@ -385,7 +410,7 @@ export async function executeGetCoverageSummary(
 
       // Perf: O(F) where F = files in report. Object.entries iteration is O(F).
       // WHY: Using for...of over entries avoids O(F) array.includes('total') check via direct continue.
-      for (const [key, val] of Object.entries<any>(parsed)) {
+      for (const [key, val] of Object.entries(parsed as Record<string, CoverageReportFileEntry>)) {
         if (key === 'total') continue;
         const filePath = path.isAbsolute(key) ? path.relative(workspaceRoot, key) : key;
         const linesMetric = val.lines || { total: 0, covered: 0, pct: 0 };
@@ -433,7 +458,7 @@ export async function executeGetCoverageSummary(
         // WHY: Could compute in one reduce, but two reduces are clearer and still O(F) with small F (<200).
         const totalCov = fileDetails.reduce((acc, f) => acc + f.coveredLinesCount, 0);
         const totalTot = fileDetails.reduce((acc, f) => acc + f.totalLinesCount, 0);
-        const avgPct = totalTot > 0 ? Math.round((totalCov / totalTot) * 10000) / 100 : 0;
+        const avgPct = totalTot > 0 ? Math.round((totalCov / totalTot) * COVERAGE_PERCENT_PRECISION) / 100 : 0;
         overallMetrics = {
           linesPct: avgPct,
           statementsPct: avgPct,
@@ -470,10 +495,11 @@ export async function executeGetCoverageSummary(
     } catch {}
 
     return successResult;
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
     return {
       success: false,
-      error: `Failed to parse coverage report: ${err.message}`,
+      error: `Failed to parse coverage report: ${errorMessage}`,
     };
   }
 }

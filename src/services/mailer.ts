@@ -784,7 +784,8 @@ export class MailerService {
         });
 
         if (res.ok) {
-          const resJson = (await res.json()) as any;
+          interface ResendSuccessResponse { id: string }
+          const resJson = (await res.json()) as ResendSuccessResponse;
           return {
             success: true,
             message: `Email successfully sent via Resend (ID: ${resJson.id}) to ${toEmail}`,
@@ -794,8 +795,8 @@ export class MailerService {
           const errorText = await res.text();
           console.warn(`\x1b[33m[Resend Warning]\x1b[0m Failed to send via Resend: ${errorText}`);
         }
-      } catch (err: any) {
-        console.warn(`\x1b[33m[Resend Error]\x1b[0m ${err.message}`);
+      } catch (err: unknown) {
+        console.warn(`\x1b[33m[Resend Error]\x1b[0m ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -827,8 +828,8 @@ export class MailerService {
           message: `Email successfully sent via SMTP to ${toEmail} (Message ID: ${info.messageId})`,
           savedFiles,
         };
-      } catch (err: any) {
-        console.warn(`\x1b[33m[SMTP Warning]\x1b[0m Failed to send via SMTP: ${err.message}`);
+      } catch (err: unknown) {
+        console.warn(`\x1b[33m[SMTP Warning]\x1b[0m Failed to send via SMTP: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -868,7 +869,7 @@ export class MailerService {
         previewUrl,
         savedFiles,
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
       await this.dispatchWebhooks(data);
       return {
         success: true,
@@ -927,7 +928,7 @@ export class MailerService {
         this.sendSlackWebhook(data, config.slackWebhookUrl)
           .then(() => { results.slack = true; })
           .catch((err) => {
-            console.warn(`\x1b[33m[Slack Webhook Error]\x1b[0m ${err.message}`);
+            console.warn(`\x1b[33m[Slack Webhook Error]\x1b[0m ${err instanceof Error ? err.message : String(err)}`);
             results.slack = false;
           })
       );
@@ -938,7 +939,7 @@ export class MailerService {
         this.sendDiscordWebhook(data, config.discordWebhookUrl)
           .then(() => { results.discord = true; })
           .catch((err) => {
-            console.warn(`\x1b[33m[Discord Webhook Error]\x1b[0m ${err.message}`);
+            console.warn(`\x1b[33m[Discord Webhook Error]\x1b[0m ${err instanceof Error ? err.message : String(err)}`);
             results.discord = false;
           })
       );
@@ -949,7 +950,7 @@ export class MailerService {
         this.sendGenericWebhook(data, config.genericWebhookUrl)
           .then(() => { results.generic = true; })
           .catch((err) => {
-            console.warn(`\x1b[33m[Generic Webhook Error]\x1b[0m ${err.message}`);
+            console.warn(`\x1b[33m[Generic Webhook Error]\x1b[0m ${err instanceof Error ? err.message : String(err)}`);
             results.generic = false;
           })
       );
