@@ -29,6 +29,17 @@ describe('File Operations & Security Sandboxing', () => {
     expect(() => resolveWorkspacePath(tmpDir, '/etc/passwd')).toThrow(/Path traversal violation/);
   });
 
+  it('should block sibling prefix bypass (vital security)', () => {
+    // Vital: workspace=/tmp/workspace, evil=/tmp/workspace-evil must NOT pass
+    // Old bug: "/tmp/workspace-evil".startsWith("/tmp/workspace") === true
+    const evilSibling = path.basename(tmpDir) + '-evil';
+    expect(() => resolveWorkspacePath(tmpDir, `../${evilSibling}/passwd`)).toThrow(/Path traversal violation/);
+    expect(() => resolveWorkspacePath(tmpDir, `../${evilSibling}`)).toThrow(/Path traversal violation/);
+    // Legitimate sibling via parent that resolves inside should still pass
+    expect(() => resolveWorkspacePath(tmpDir, '.')).not.toThrow();
+    expect(resolveWorkspacePath(tmpDir, '.')).toBe(tmpDir);
+  });
+
   it('should list directory contents with metadata', () => {
     const res = executeListDir(tmpDir, { dirPath: '.' });
     expect(res.entries.length).toBeGreaterThanOrEqual(2);

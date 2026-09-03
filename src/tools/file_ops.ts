@@ -360,8 +360,13 @@ export const grepSearchFunctionDeclaration: FunctionDeclaration = {
  * ephemeral clones on Linux CI so this is not a practical bypass.
  */
 export function resolveWorkspacePath(workspaceRoot: string, relativePath: string): string {
+  const workspaceResolved = path.resolve(workspaceRoot);
   const resolved = path.resolve(workspaceRoot, relativePath);
-  if (!resolved.startsWith(path.resolve(workspaceRoot))) {
+  // Vital fix: prefix check must include path separator to prevent sibling bypass
+  // e.g., workspace=/tmp/workspace, resolved=/tmp/workspace-evil should NOT pass
+  // Old: resolved.startsWith(workspaceResolved) → true for sibling
+  // New: require exact match or prefix + sep
+  if (resolved !== workspaceResolved && !resolved.startsWith(workspaceResolved + path.sep)) {
     throw new Error(`Path traversal violation: ${relativePath} resolves outside workspace.`);
   }
   return resolved;
