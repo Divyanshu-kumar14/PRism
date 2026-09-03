@@ -1,17 +1,21 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# PRism — Multi-stage Dockerfile
+# PRism — Multi-stage Dockerfile (Three Agents: Tester, Sentinel, Healer)
 # =============================================================================
 # What it does:
 # - Stage 1 (builder): installs deps (including dev) + compiles TypeScript (src -> dist)
+#   Builds all three agents: dist/index.js (Tester), dist/digest_cli.js (Sentinel),
+#   dist/healer_cli.js (Healer) + dist/scheduler.js (daemon)
 # - Stage 2 (runner): production-only deps + git + non-root user + tini init
 #
 # Key configs:
 # - NODE_ENV=production (hides dev deps, enables prod optimizations)
 # - WORKSPACE_DIR/ reports/ are volumes — survive container restarts
+# - HEALER_WEBHOOK_PORT=8787 — Healer webhook (if enabled) listens inside container
 # - Default CMD runs the 10:00 PM IST scheduler daemon; override for one-shot jobs:
 #     docker run --rm --env-file .env prism digest -- --since 7d
 #     docker run --rm --env-file .env prism coverage -- --focus src/lib
+#     docker run --rm --env-file .env prism healer -- --command "npx tsc --noEmit" --allow-push
 #
 # Usage:
 #   docker build -t prism .
@@ -77,17 +81,23 @@ COPY --chown=prism:prism README.md ./
 
 USER prism
 
-# Expose no port — scheduler is cron-only. If you add a health endpoint later, expose 3000.
+# Ports:
+# - 8787: Healer webhook listener (HEALER_ENABLED=true, HEALER_WEBHOOK_PORT=8787)
+#   Uncomment when you enable the Healer webhook daemon.
+# EXPOSE 8787
 # EXPOSE 3000
 
-# Healthcheck: scheduler must be running (PID 1 is tini -> node). Check reports/ writable.
+# Healthcheck: scheduler must be running (PID 1 is tini -> node). Check dist/ exists.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "process.exit(require('fs').existsSync('/app/dist/scheduler.js') ? 0 : 1)"
+  CMD node -e "process.exit(require('fs').existsSync('/app/dist/scheduler.js') && require('fs').existsSync('/app/dist/healer_cli.js') ? 0 : 1)"
 
 # Use tini as init to forward SIGTERM/SIGINT to node-cron correctly
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # Default: run the daily 22:00 IST scheduler daemon
-# Override: `docker run --rm prism node dist/digest_cli.js -- --since 7d`
-#           `docker run --rm prism node dist/index.js -- --focus src/lib`
+# Override one-shots:
+#   docker run --rm prism node dist/digest_cli.js -- --since 7d
+#   docker run --rm prism node dist/index.js -- --focus src/lib
+#   docker run --rm prism node dist/healer_cli.js -- --pr 42 --branch feat/x --command "npm test" --allow-push
+#   docker run --rm prism node dist/healer_cli.js -- --command "npx tsc --noEmit"
 CMD ["node", "dist/scheduler.js"]
